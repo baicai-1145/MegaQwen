@@ -36,13 +36,36 @@ Improvement: +44.9 tok/s (26.3%)
 
 ## Optimization 2: Head-Based Work Distribution
 
-**Status**: Designed, not yet implemented
+**Status**: Implemented and tested - NOT VIABLE
 
 **Approach**: Assign blocks to attention heads (5 blocks per Q head) so QKV + attention can proceed head-local without grid.sync between QKV and attention.
 
-**Expected syncs eliminated**: 28 (1 per layer)
+**Syncs eliminated**: 28 (1 per layer)
 
-**Complexity**: High - requires restructuring work distribution and handling GQA head mapping.
+**Results**:
+```
+Position    Original    Optimized    Speedup
+-------------------------------------------------
+1           4.023ms     6.862ms      0.59x
+10          4.051ms     6.892ms      0.59x
+50          4.151ms     6.990ms      0.59x
+100         4.272ms     7.039ms      0.61x
+200         6.921ms     7.293ms      0.95x
+-------------------------------------------------
+Average     4.683ms     7.015ms      0.67x
+
+Original:  213.5 tok/s
+Optimized: 142.5 tok/s
+Result:    -33% throughput (WORSE)
+```
+
+**Why it failed**:
+1. QKV is memory-bound - all 82 blocks should participate for max memory parallelism
+2. Only 16 leader blocks work during QKV phase - 66 blocks idle
+3. Eliminating 1 sync per layer (~5-10us each x 28 = 140-280us) doesn't compensate for lost parallelism
+4. The memory bandwidth loss dominates the sync savings
+
+**Lesson**: Don't sacrifice block utilization to eliminate syncs. The sync overhead is small compared to the parallelism benefits.
 
 ## Optimization 3: Fused Phases
 
@@ -59,7 +82,7 @@ Improvement: +44.9 tok/s (26.3%)
 | Optimization | Syncs Eliminated | Speedup | Status |
 |-------------|-----------------|---------|--------|
 | Redundant RMSNorm | 56 | 1.26x (avg), 1.42x (short seq) | Done |
-| Head-Based Distribution | 28 | TBD | Designed |
+| Head-Based Distribution | 28 | **0.67x (slower)** | Done - not viable |
 | Fused Phases | 56 | TBD | Not started |
 
 ## Running the Experiments
