@@ -17,7 +17,7 @@
 | vLLM | 107 | 196 | 206 | 0.55 | 1.82x |
 | llama.cpp | 50 | 195 | 201 | 0.26 | 0.85x |
 | ExLlamaV2 | 98 | 197 | 207 | 0.50 | 1.66x |
-| SGLang | - | - | - | - | flashinfer JIT upstream bug |
+| SGLang | 107 | 210 | 210 | 0.51 | 1.81x |
 
 ### Key Findings
 
@@ -166,6 +166,6 @@ python /tmp/llama.cpp/convert_hf_to_gguf.py \
 - [x] Add llama.cpp benchmark (GGUF F16)
 - [x] Add vLLM benchmark
 - [x] Add ExLlamaV2 benchmark (required flash-attn 2.8.3)
-- [ ] Fix SGLang flashinfer JIT paths (blocked: upstream bug)
+- [x] Add SGLang benchmark (server mode via OpenAI API)
 - [ ] Implement fused phases optimization
-- [ ] Add TensorRT-LLM benchmark (blocked: requires Python 3.10 or 3.12, env has 3.11)
+- [ ] Add TensorRT-LLM benchmark (blocked: requires MPI library, needs `sudo apt install libopenmpi-dev`)
