@@ -165,7 +165,7 @@ python /tmp/llama.cpp/convert_hf_to_gguf.py \
 - [x] Expose logits for KL divergence measurement
 - [x] Add llama.cpp benchmark (GGUF F16)
 - [x] Add vLLM benchmark
-- [ ] Fix SGLang flashinfer configuration
-- [ ] Fix ExLlamaV2 Flash Attention compatibility
+- [x] Add ExLlamaV2 benchmark (required flash-attn 2.8.3)
+- [ ] Fix SGLang flashinfer JIT paths (blocked: upstream bug)
 - [ ] Implement fused phases optimization
 - [ ] Add TensorRT-LLM benchmark
