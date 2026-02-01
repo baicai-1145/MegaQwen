@@ -12,16 +12,19 @@
 
 | Framework | tok/s | Avg Power (W) | Peak Power (W) | tok/J | Speedup vs HF |
 |-----------|-------|---------------|----------------|-------|---------------|
-| HuggingFace | 59 | 186 | 192 | 0.32 | 1.0x |
-| **Megakernel** | **158** | 205 | 233 | **0.77** | **2.68x** |
+| **TensorRT-LLM** | **355** | 290 | 290 | **1.22** | **6.01x** |
+| Megakernel | 158 | 205 | 233 | 0.77 | 2.68x |
 | vLLM | 107 | 196 | 206 | 0.55 | 1.82x |
-| llama.cpp | 50 | 195 | 201 | 0.26 | 0.85x |
-| ExLlamaV2 | 98 | 197 | 207 | 0.50 | 1.66x |
 | SGLang | 107 | 210 | 210 | 0.51 | 1.81x |
+| ExLlamaV2 | 98 | 197 | 207 | 0.50 | 1.66x |
+| HuggingFace | 59 | 186 | 192 | 0.32 | 1.0x |
+| llama.cpp | 50 | 195 | 201 | 0.26 | 0.85x |
 
 ### Key Findings
 
-- **Megakernel is 2.68x faster** and **2.41x more energy efficient** than HuggingFace
+- **TensorRT-LLM is 6x faster** and **3.8x more energy efficient** than HuggingFace
+- **TensorRT-LLM is 2.24x faster** than Megakernel (but requires engine compilation)
+- **Megakernel is 2.68x faster** than HuggingFace with no compilation step
 - **Megakernel is 1.47x faster** than vLLM
 - **llama.cpp (GGUF F16)** is slower than HuggingFace on GPU - better suited for CPU inference
 - Higher peak power (233W) but significantly faster completion = better energy efficiency
@@ -114,11 +117,12 @@ Status: Not yet implemented.
 
 ## Summary Table
 
-| Metric | Megakernel | vs HuggingFace | vs vLLM |
-|--------|------------|----------------|---------|
-| Decode tok/s | 158 | **2.68x** | 1.47x |
-| Energy (tok/J) | 0.77 | **2.41x** | 1.40x |
-| KL Divergence | 0.000582 | near-identical | - |
+| Metric | TensorRT-LLM | Megakernel | vs HuggingFace |
+|--------|--------------|------------|----------------|
+| Decode tok/s | 355 | 158 | 6.01x / 2.68x |
+| Energy (tok/J) | 1.22 | 0.77 | 3.81x / 2.41x |
+| Compilation | Required | None | - |
+| KL Divergence | - | 0.000582 | near-identical |
 
 ---
 
@@ -168,4 +172,4 @@ python /tmp/llama.cpp/convert_hf_to_gguf.py \
 - [x] Add ExLlamaV2 benchmark (required flash-attn 2.8.3)
 - [x] Add SGLang benchmark (server mode via OpenAI API)
 - [ ] Implement fused phases optimization
-- [ ] Add TensorRT-LLM benchmark (blocked: requires MPI library, needs `sudo apt install libopenmpi-dev`)
+- [x] Add TensorRT-LLM benchmark (355 tok/s, 6x faster than HF)
