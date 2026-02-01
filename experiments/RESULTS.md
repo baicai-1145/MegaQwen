@@ -42,6 +42,21 @@
 - **llama.cpp (GGUF F16)** is slower than HuggingFace on GPU - better suited for CPU inference
 - Higher peak power (233W) but significantly faster completion = better energy efficiency
 
+### Position-Dependent Throughput (Megakernel)
+
+Decode throughput decreases with KV cache length (attention must read all previous tokens):
+
+| Position | tok/s | ms/tok |
+|----------|-------|--------|
+| 1 | 242 | 4.13 |
+| 10 | 241 | 4.16 |
+| 50 | 229 | 4.37 |
+| 100 | 175 | 5.72 |
+| 200 | 142 | 7.03 |
+| 300 | 139 | 7.21 |
+
+This is a **decode-bound** issue, not prefill. The attention kernel must read O(n) KV cache entries per decode step.
+
 ---
 
 ## 2. Quality Metrics
