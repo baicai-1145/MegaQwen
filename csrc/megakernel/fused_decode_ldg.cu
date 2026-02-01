@@ -276,8 +276,25 @@ __device__ void ldg_qk_norm_rope_cache(
 }
 
 // =============================================================================
-// Attention with __ldg for KV cache
+// Attention with __ldg for KV cache + block divergence for prefetching
 // =============================================================================
+
+// Prefetch weights into L2 cache using __ldg reads
+__device__ void ldg_prefetch_weights_l2(
+    const __nv_bfloat16* __restrict__ weights,
+    int num_elements
+) {
+    // Each thread prefetches strided elements to warm L2 cache
+    // Using __ldg ensures we go through texture/L2 path
+    float dummy = 0.0f;
+    for (int i = threadIdx.x; i < num_elements; i += LDG_BLOCK_SIZE * 4) {
+        // Read but don't use - compiler won't optimize out due to volatile-like __ldg
+        dummy += __bfloat162float(__ldg(weights + i));
+    }
+    // Prevent optimization (result stored to shared but never used)
+    __shared__ float s_dummy;
+    if (threadIdx.x == 0) s_dummy = dummy;
+}
 
 __device__ void ldg_attention(
     cg::grid_group& grid,
@@ -287,19 +304,64 @@ __device__ void ldg_attention(
     float* __restrict__ attn_out,
     int cache_len,
     int max_seq_len,
-    float attn_scale
+    float attn_scale,
+    // Weights to prefetch during attention (for blocks not doing attention)
+    const __nv_bfloat16* __restrict__ o_weight,
+    const __nv_bfloat16* __restrict__ gate_weight,
+    const __nv_bfloat16* __restrict__ up_weight
 ) {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
+    // Only first NUM_Q_HEADS blocks do attention work
+    // Remaining blocks prefetch MLP weights to warm L2 cache
+    const int ATTN_BLOCKS = NUM_Q_HEADS;  // 16 blocks for 16 Q heads
+
+    if (block_id >= ATTN_BLOCKS) {
+        // This block prefetches weights while attention computes
+        // Distribute prefetch work across non-attention blocks
+        int prefetch_block_id = block_id - ATTN_BLOCKS;
+        int num_prefetch_blocks = num_blocks - ATTN_BLOCKS;
+
+        // O projection: Q_SIZE x HIDDEN_SIZE = 2048 x 1024 = 2M elements
+        // Gate: HIDDEN_SIZE x INTERMEDIATE_SIZE = 1024 x 3072 = 3M elements
+        // Up: same as gate
+
+        // Divide O projection among first half of prefetch blocks
+        if (prefetch_block_id < num_prefetch_blocks / 3) {
+            int elems_per_block = (Q_SIZE * HIDDEN_SIZE) / (num_prefetch_blocks / 3 + 1);
+            int start = prefetch_block_id * elems_per_block;
+            ldg_prefetch_weights_l2(o_weight + start, elems_per_block);
+        }
+        // Gate projection
+        else if (prefetch_block_id < 2 * num_prefetch_blocks / 3) {
+            int adjusted_id = prefetch_block_id - num_prefetch_blocks / 3;
+            int elems_per_block = (HIDDEN_SIZE * INTERMEDIATE_SIZE) / (num_prefetch_blocks / 3 + 1);
+            int start = adjusted_id * elems_per_block;
+            ldg_prefetch_weights_l2(gate_weight + start, elems_per_block);
+        }
+        // Up projection
+        else {
+            int adjusted_id = prefetch_block_id - 2 * num_prefetch_blocks / 3;
+            int elems_per_block = (HIDDEN_SIZE * INTERMEDIATE_SIZE) / (num_prefetch_blocks / 3 + 1);
+            int start = adjusted_id * elems_per_block;
+            ldg_prefetch_weights_l2(up_weight + start, elems_per_block);
+        }
+
+        // Wait for all blocks at grid.sync() at the end
+        grid.sync();
+        return;
+    }
+
     // Shared memory for cross-warp reduction of online softmax
     __shared__ float s_max_score[LDG_NUM_WARPS];
     __shared__ float s_sum_exp[LDG_NUM_WARPS];
     __shared__ float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
 
-    int heads_per_block = (NUM_Q_HEADS + num_blocks - 1) / num_blocks;
+    // Each of the 16 attention blocks handles one Q head
+    int heads_per_block = (NUM_Q_HEADS + ATTN_BLOCKS - 1) / ATTN_BLOCKS;
     int head_start = block_id * heads_per_block;
     int head_end = min(head_start + heads_per_block, NUM_Q_HEADS);
 
@@ -611,7 +673,8 @@ ldg_decode_kernel(
 
         ldg_attention(
             grid, g_q, layer_k_cache, layer_v_cache, g_attn_out,
-            cache_len, max_seq_len, attn_scale
+            cache_len, max_seq_len, attn_scale,
+            w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight
         );
 
         ldg_o_proj_postnorm_mlp(
