@@ -51,8 +51,8 @@ struct LDGLayerWeights {
     const void* down_proj_weight;
 };
 
-extern "C" void launch_ldg_decode(
-    int input_token_id,
+	extern "C" void launch_ldg_decode(
+    const int* input_token_id,
     int* output_token_id,
     const void* embed_weight,
     const LDGLayerWeights* layer_weights,
@@ -71,18 +71,22 @@ extern "C" void launch_ldg_decode(
     void* g_attn_out,
     void* g_mlp_intermediate,
     void* g_normalized,
+    void* attn_partial_max,
+    void* attn_partial_sum,
+    void* attn_partial_out,
     void* block_max_vals,
-    void* block_max_idxs,
-    int num_layers,
-    int position,
-    int cache_len,
-    int max_seq_len,
-    float attn_scale,
-    cudaStream_t stream
-);
+	    void* block_max_idxs,
+	    int num_layers,
+	    const int* position_ptr,
+	    int max_seq_len,
+	    float attn_scale,
+	    int decode_num_blocks,
+	    int lm_num_blocks,
+	    cudaStream_t stream
+	);
 
-extern "C" void launch_ldg_decode_with_logits(
-    int input_token_id,
+	extern "C" void launch_ldg_decode_with_logits(
+    const int* input_token_id,
     int* output_token_id,
     float* logits_output,
     const void* embed_weight,
@@ -102,15 +106,19 @@ extern "C" void launch_ldg_decode_with_logits(
     void* g_attn_out,
     void* g_mlp_intermediate,
     void* g_normalized,
+    void* attn_partial_max,
+    void* attn_partial_sum,
+    void* attn_partial_out,
     void* block_max_vals,
-    void* block_max_idxs,
-    int num_layers,
-    int position,
-    int cache_len,
-    int max_seq_len,
-    float attn_scale,
-    cudaStream_t stream
-);
+	    void* block_max_idxs,
+	    int num_layers,
+	    const int* position_ptr,
+	    int max_seq_len,
+	    float attn_scale,
+	    int decode_num_blocks,
+	    int lm_num_blocks,
+	    cudaStream_t stream
+	);
 
 static std::vector<LDGLayerWeights> g_layer_weights;
 static LDGLayerWeights* d_layer_weights = nullptr;
@@ -183,10 +191,17 @@ int decode_ldg(
 ) {
     float attn_scale = 1.0f / sqrtf(128.0f);
     auto output_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+	    auto input_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
+	    auto pos_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
+	    auto attn_partial_max = torch::empty({1184}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    auto attn_partial_sum = torch::empty({1184}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    auto attn_partial_out = torch::empty({1184 * 128}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+	    cudaMemcpyAsync(input_token.data_ptr(), &input_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
+	    cudaMemcpyAsync(pos_token.data_ptr(), &position, sizeof(int), cudaMemcpyHostToDevice, stream);
 
     launch_ldg_decode(
-        input_token_id,
+        (const int*)input_token.data_ptr(),
         output_token.data_ptr<int>(),
         d_embed_weight.data_ptr(),
         d_layer_weights,
@@ -205,15 +220,19 @@ int decode_ldg(
         g_attn_out.data_ptr(),
         g_mlp_intermediate.data_ptr(),
         g_normalized.data_ptr(),
+        attn_partial_max.data_ptr(),
+        attn_partial_sum.data_ptr(),
+        attn_partial_out.data_ptr(),
         block_max_vals.data_ptr(),
-        block_max_idxs.data_ptr(),
-        num_layers,
-        position,
-        cache_len,
-        max_seq_len,
-        attn_scale,
-        stream
-    );
+	        block_max_idxs.data_ptr(),
+	        num_layers,
+	        (const int*)pos_token.data_ptr(),
+	        max_seq_len,
+	        attn_scale,
+	        0,
+	        0,
+	        stream
+	    );
 
     cudaStreamSynchronize(stream);
     return output_token.item<int>();
@@ -245,11 +264,18 @@ std::tuple<int, torch::Tensor> decode_ldg_with_logits(
 ) {
     float attn_scale = 1.0f / sqrtf(128.0f);
     auto output_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
-    auto logits = torch::empty({151936}, torch::dtype(torch::kFloat32).device(k_cache.device()));
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+	    auto input_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
+	    auto pos_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
+	    auto logits = torch::empty({151936}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    auto attn_partial_max = torch::empty({1184}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    auto attn_partial_sum = torch::empty({1184}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    auto attn_partial_out = torch::empty({1184 * 128}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+	    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+	    cudaMemcpyAsync(input_token.data_ptr(), &input_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
+	    cudaMemcpyAsync(pos_token.data_ptr(), &position, sizeof(int), cudaMemcpyHostToDevice, stream);
 
     launch_ldg_decode_with_logits(
-        input_token_id,
+        (const int*)input_token.data_ptr(),
         output_token.data_ptr<int>(),
         logits.data_ptr<float>(),
         d_embed_weight.data_ptr(),
@@ -269,15 +295,19 @@ std::tuple<int, torch::Tensor> decode_ldg_with_logits(
         g_attn_out.data_ptr(),
         g_mlp_intermediate.data_ptr(),
         g_normalized.data_ptr(),
+        attn_partial_max.data_ptr(),
+        attn_partial_sum.data_ptr(),
+        attn_partial_out.data_ptr(),
         block_max_vals.data_ptr(),
-        block_max_idxs.data_ptr(),
-        num_layers,
-        position,
-        cache_len,
-        max_seq_len,
-        attn_scale,
-        stream
-    );
+	        block_max_idxs.data_ptr(),
+	        num_layers,
+	        (const int*)pos_token.data_ptr(),
+	        max_seq_len,
+	        attn_scale,
+	        0,
+	        0,
+	        stream
+	    );
 
     cudaStreamSynchronize(stream);
     return std::make_tuple(output_token.item<int>(), logits);
