@@ -55,6 +55,18 @@ __global__ void prefill_lm_head_phase2(
 // Decode-only kernels: QK norm + RoPE + KV cache, and attention over cache.
 // =============================================================================
 
+__device__ __forceinline__ int kv_cache_physical_token(
+    int logical_token,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size
+) {
+    if (kv_block_table == nullptr || kv_block_size <= 0) return logical_token;
+    int logical_block = logical_token / kv_block_size;
+    int in_block = logical_token - logical_block * kv_block_size;
+    int physical_block = kv_block_table[logical_block];
+    return physical_block * kv_block_size + in_block;
+}
+
 // Specialized for a single query token (seq_len=1).
 // Grid: (max(num_q_heads, num_kv_heads)), Block: 128
 __global__ void decode_qk_norm_rope_cache_kernel(
@@ -71,6 +83,8 @@ __global__ void decode_qk_norm_rope_cache_kernel(
     int num_kv_heads,
     int head_dim,
     int max_seq_len,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size,
     const int* __restrict__ position_ptr  // device scalar
 ) {
     int head = (int)blockIdx.x;
@@ -130,8 +144,10 @@ __global__ void decode_qk_norm_rope_cache_kernel(
         __nv_bfloat16* k_head = k + head * head_dim;
         const __nv_bfloat16* v_head = v + head * head_dim;
 
-        __nv_bfloat16* k_cache_head = k_cache + head * max_seq_len * head_dim + position * head_dim;
-        __nv_bfloat16* v_cache_head = v_cache + head * max_seq_len * head_dim + position * head_dim;
+        int position_physical = kv_cache_physical_token(position, kv_block_table, kv_block_size);
+        if (position_physical >= max_seq_len) return;
+        __nv_bfloat16* k_cache_head = k_cache + head * max_seq_len * head_dim + position_physical * head_dim;
+        __nv_bfloat16* v_cache_head = v_cache + head * max_seq_len * head_dim + position_physical * head_dim;
 
         float sum_sq = 0.0f;
         for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
@@ -182,6 +198,8 @@ __global__ void decode_attention_cache_legacy_kernel(
     int head_dim,
     int max_seq_len,
     float attn_scale,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size,
     const int* __restrict__ position_ptr             // device scalar
 ) {
     int warp_idx = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
@@ -215,8 +233,10 @@ __global__ void decode_attention_cache_legacy_kernel(
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
 
     for (int t = 0; t < cache_len; t++) {
-        const __nv_bfloat16* k_vec = k_base + t * head_dim;
-        const __nv_bfloat16* v_vec = v_base + t * head_dim;
+        int physical_t = kv_cache_physical_token(t, kv_block_table, kv_block_size);
+        if (physical_t >= max_seq_len) continue;
+        const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
+        const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
 
         float dot = 0.0f;
         #pragma unroll
@@ -263,6 +283,8 @@ __global__ void decode_attention_cache_splitk_kernel(
     int max_seq_len,
     float attn_scale,
     int warps_per_head,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size,
     const int* __restrict__ position_ptr             // device scalar
 ) {
     constexpr int kMaxWarps = 8;
@@ -317,8 +339,10 @@ __global__ void decode_attention_cache_splitk_kernel(
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
 
     for (int t = warp_id; t < cache_len; t += active_warps) {
-        const __nv_bfloat16* k_vec = k_base + t * head_dim;
-        const __nv_bfloat16* v_vec = v_base + t * head_dim;
+        int physical_t = kv_cache_physical_token(t, kv_block_table, kv_block_size);
+        if (physical_t >= max_seq_len) continue;
+        const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
+        const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
 
         float dot = 0.0f;
         #pragma unroll
@@ -398,6 +422,8 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
     int warps_per_head,
     int chunk_size,
     int max_chunks,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size,
     const int* __restrict__ position_ptr
 ) {
     constexpr int kMaxWarps = 8;
@@ -459,8 +485,10 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
 
     if (warp_id < active_warps) {
         for (int t = t_start + warp_id; t < t_end; t += active_warps) {
-            const __nv_bfloat16* k_vec = k_base + t * head_dim;
-            const __nv_bfloat16* v_vec = v_base + t * head_dim;
+            int physical_t = kv_cache_physical_token(t, kv_block_table, kv_block_size);
+            if (physical_t >= max_seq_len) continue;
+            const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
+            const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
 
             float dot = 0.0f;
             #pragma unroll

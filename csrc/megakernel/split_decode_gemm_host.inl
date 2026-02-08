@@ -25,6 +25,8 @@ extern "C" void launch_split_decode_gemm(
     const void* const* down_w4_packed_ptrs,        // host [num_layers], each uint8 packed [H*I/2]
     const void* const* down_w4_scales_ptrs,        // host [num_layers], float [H*I/64]
     const void* const* down_w4_codebook_ptrs,      // host [num_layers], float [16]
+    const int* kv_block_table,                     // optional [num_kv_blocks], logical->physical
+    int kv_block_size,                             // token block size for paged KV
     const void* final_norm_weight,
     const void* lm_head_weight,
     const void* cos_table,        // bf16 [max_seq, head_dim]
@@ -117,6 +119,54 @@ extern "C" void launch_split_decode_gemm(
     if (qkv_weight_packed_ptrs == nullptr || gateup_weight_packed_ptrs == nullptr || down_weight_ptrs == nullptr) {
         printf("[MEGAQWEN_SPLIT] packed weight ptrs are null\n");
         return;
+    }
+
+    bool debug_paged_kv = _split_debug_paged_kv_take_ticket();
+    if (debug_paged_kv) {
+        int position_host = -1;
+        if (position_ptr != nullptr) {
+            cudaMemcpyAsync(&position_host, position_ptr, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+        }
+        int cache_len = position_host + 1;
+        if (cache_len < 0) cache_len = 0;
+        if (cache_len > max_seq_len) cache_len = max_seq_len;
+        int logical_block = -1;
+        int physical_block = -1;
+        int physical_pos = -1;
+        if (kv_block_table != nullptr && kv_block_size > 0 && position_host >= 0) {
+            logical_block = position_host / kv_block_size;
+            if (logical_block >= 0) {
+                cudaMemcpyAsync(&physical_block, kv_block_table + logical_block, sizeof(int), cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+                int in_block = position_host - logical_block * kv_block_size;
+                physical_pos = physical_block * kv_block_size + in_block;
+            }
+        } else {
+            physical_pos = position_host;
+        }
+        std::printf(
+            "[MEGAQWEN_DEBUG] PAGED_KV token pos=%d cache_len=%d block_size=%d logical_block=%d physical_block=%d physical_pos=%d\n",
+            position_host, cache_len, kv_block_size, logical_block, physical_block, physical_pos);
+
+        if (kv_block_table != nullptr && kv_block_size > 0) {
+            static bool dumped_table = false;
+            if (!dumped_table) {
+                dumped_table = true;
+                constexpr int kDumpN = 16;
+                int table_host[kDumpN];
+                int dump_n = (max_seq_len + kv_block_size - 1) / kv_block_size;
+                if (dump_n > kDumpN) dump_n = kDumpN;
+                if (dump_n < 0) dump_n = 0;
+                if (dump_n > 0) {
+                    cudaMemcpyAsync(table_host, kv_block_table, sizeof(int) * dump_n, cudaMemcpyDeviceToHost, stream);
+                    cudaStreamSynchronize(stream);
+                    std::printf("[MEGAQWEN_DEBUG] PAGED_KV block_table_head:");
+                    for (int i = 0; i < dump_n; i++) std::printf(" %d->%d", i, table_host[i]);
+                    std::printf("\n");
+                }
+            }
+        }
     }
 
     // 0) Embed lookup -> hidden_f32
@@ -279,6 +329,8 @@ extern "C" void launch_split_decode_gemm(
             NUM_KV_HEADS,
             HEAD_DIM,
             max_seq_len,
+            kv_block_table,
+            kv_block_size,
             position_ptr
         );
         dbg_end(dbg_qk);
@@ -306,6 +358,8 @@ extern "C" void launch_split_decode_gemm(
                 attn_warps,
                 split_attn_chunk_size,
                 split_attn_max_chunks,
+                kv_block_table,
+                kv_block_size,
                 position_ptr
             );
             decode_attention_cache_splitk_phase2_kernel<<<NUM_Q_HEADS, 128, 0, stream>>>(
@@ -332,6 +386,8 @@ extern "C" void launch_split_decode_gemm(
                 max_seq_len,
                 attn_scale,
                 attn_warps,
+                kv_block_table,
+                kv_block_size,
                 position_ptr
             );
         } else {
@@ -349,6 +405,8 @@ extern "C" void launch_split_decode_gemm(
                 HEAD_DIM,
                 max_seq_len,
                 attn_scale,
+                kv_block_table,
+                kv_block_size,
                 position_ptr
             );
         }

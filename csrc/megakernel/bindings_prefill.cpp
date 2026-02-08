@@ -186,6 +186,8 @@ extern "C" void launch_split_decode_gemm(
     const void* const* down_w4_packed_ptrs,
     const void* const* down_w4_scales_ptrs,
     const void* const* down_w4_codebook_ptrs,
+    const int* kv_block_table,
+    int kv_block_size,
     const void* final_norm_weight,
     const void* lm_head_weight,
     const void* cos_table,
@@ -433,6 +435,26 @@ public:
                 }
             }
 
+            split_kv_paged_ = false;
+            if (const char* s = std::getenv("MEGAQWEN_SPLIT_KV_LAYOUT")) {
+                if (std::strcmp(s, "paged") == 0 || std::strcmp(s, "page") == 0) {
+                    split_kv_paged_ = true;
+                }
+            }
+            if (const char* s = std::getenv("MEGAQWEN_SPLIT_KV_PAGED")) {
+                if (std::strcmp(s, "") != 0 &&
+                    std::strcmp(s, "0") != 0 &&
+                    std::strcmp(s, "false") != 0 &&
+                    std::strcmp(s, "False") != 0) {
+                    split_kv_paged_ = true;
+                }
+            }
+            split_kv_block_size_ = 16;
+            if (const char* s = std::getenv("MEGAQWEN_SPLIT_KV_BLOCK_SIZE")) {
+                int v = std::atoi(s);
+                if (v > 0) split_kv_block_size_ = v;
+            }
+
             // Build packed weights for split backend:
             // QKV:   [4096, 1024] = cat([Q, K, V], dim=0)
             // GateUp:[6144, 1024] = cat([gate, up], dim=0)
@@ -470,6 +492,25 @@ public:
                     {split_attn_max_chunks_, 16, 128},
                     torch::dtype(torch::kFloat32).device(torch::kCUDA)
                 );
+                if (split_kv_paged_) {
+                    split_kv_num_blocks_ = (max_seq_len_ + split_kv_block_size_ - 1) / split_kv_block_size_;
+                    if (split_kv_num_blocks_ < 1) split_kv_num_blocks_ = 1;
+                    split_kv_block_table_ = torch::empty(
+                        {split_kv_num_blocks_},
+                        torch::dtype(torch::kInt32).device(torch::kCUDA)
+                    );
+                    launch_ldg_fill_iota(
+                        (int*)split_kv_block_table_.data_ptr<int>(),
+                        0,
+                        split_kv_num_blocks_,
+                        c10::cuda::getCurrentCUDAStream().stream()
+                    );
+                    std::printf("[MEGAQWEN_SPLIT] kv layout=paged block=%d blocks=%d\n",
+                                split_kv_block_size_, split_kv_num_blocks_);
+                } else {
+                    split_kv_block_table_ = torch::Tensor();
+                    split_kv_num_blocks_ = 0;
+                }
 
                 split_qkv_weight_tensors_.reserve(num_layers_);
                 split_gateup_weight_tensors_.reserve(num_layers_);
@@ -1248,6 +1289,8 @@ public:
                 split_down_w4_packed_ptrs_.empty() ? nullptr : split_down_w4_packed_ptrs_.data(),
                 split_down_w4_scales_ptrs_.empty() ? nullptr : split_down_w4_scales_ptrs_.data(),
                 split_down_w4_codebook_ptrs_.empty() ? nullptr : split_down_w4_codebook_ptrs_.data(),
+                split_kv_block_table_.defined() ? (const int*)split_kv_block_table_.data_ptr<int>() : nullptr,
+                split_kv_block_size_,
                 final_norm_weight_.data_ptr(),
                 lm_head_weight_.data_ptr(),
                 cos_table_.data_ptr(),
@@ -1435,6 +1478,10 @@ private:
     torch::Tensor split_attn_partial_out_;
     int split_attn_chunk_size_{0};
     int split_attn_max_chunks_{0};
+    bool split_kv_paged_{false};
+    int split_kv_block_size_{16};
+    int split_kv_num_blocks_{0};
+    torch::Tensor split_kv_block_table_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
