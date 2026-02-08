@@ -296,6 +296,21 @@ static inline int _split_kv_block_size() {
     return v;
 }
 
+static inline bool _split_kv_fp8_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_KV_FP8");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
 static inline int _split_attn_impl() {
     // 0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase), 3=flash_decode(tile-online)
     static int mode = -1;
@@ -365,6 +380,21 @@ static inline int _split_flash_attn_warps_per_head() {
     if (v > 8) v = 8;
     warps = v;
     return warps;
+}
+
+static inline int _split_flash_parts() {
+    static int parts = -1;
+    if (parts > 0) return parts;
+    int v = 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_FLASH_PARTS");
+    if (s != nullptr && std::strcmp(s, "") != 0) {
+        int parsed = std::atoi(s);
+        if (parsed > 0) v = parsed;
+    }
+    if (v < 1) v = 1;
+    if (v > 4) v = 4;
+    parts = v;
+    return parts;
 }
 
 static inline int _split_debug_budget() {
@@ -679,9 +709,11 @@ extern "C" void split_debug_stage_print_summary() {
     printf("         gemv=%5lld\n", agg.down_gemv);
     printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
            _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
-    printf("         kv_layout=%s kv_block=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
+    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d flash_parts=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
            _split_kv_layout_paged_enabled() ? "paged" : "contiguous",
            _split_kv_block_size(),
+           _split_kv_fp8_enabled() ? 1 : 0,
+           _split_flash_parts(),
            _split_qkv_w4_enabled() ? 1 : 0,
            agg.qkv_w4,
            _split_o_w4_enabled() ? 1 : 0,

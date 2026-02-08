@@ -32,8 +32,8 @@ class WhisperFbankTorch:
     def extract(self, audio: np.ndarray, *, sampling_rate: int) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return (input_features, attention_mask) on self.device.
 
-        - input_features: [1, n_mels, nb_max_frames] float32
-        - attention_mask: [1, nb_max_frames] int64 (1=valid, 0=pad)
+        - input_features: [1, n_mels, n_frames] float32
+        - attention_mask: None (single-sample path, no frame padding)
         """
         if sampling_rate != 16000:
             raise ValueError(f"Expected sampling_rate=16000, got {sampling_rate}")
@@ -41,19 +41,7 @@ class WhisperFbankTorch:
         if audio.ndim != 1:
             raise ValueError(f"Expected mono audio 1D array, got shape={audio.shape}")
 
-        # WhisperFeatureExtractor pads/truncates waveform to `n_samples` and returns a frame-level mask.
-        n = int(audio.shape[0])
-        n_valid_samples = min(n, self.cfg.n_samples)
-        valid_frames = int((n_valid_samples + self.cfg.hop_length - 1) // self.cfg.hop_length)
-        valid_frames = min(valid_frames, self.cfg.nb_max_frames)
-
-        # Pad / truncate to fixed window.
-        if n >= self.cfg.n_samples:
-            audio_fixed = audio[: self.cfg.n_samples]
-        else:
-            audio_fixed = np.pad(audio, (0, self.cfg.n_samples - n), mode="constant", constant_values=0.0)
-
-        waveform = torch.from_numpy(audio_fixed).to(device=self.device, dtype=torch.float32)
+        waveform = torch.from_numpy(audio).to(device=self.device, dtype=torch.float32)
 
         if self.cfg.dither != 0.0:
             waveform = waveform + float(self.cfg.dither) * torch.randn_like(waveform)
@@ -65,28 +53,14 @@ class WhisperFbankTorch:
             window=self.window,
             return_complex=True,
         )
-        # Match upstream: drop the last frame to get exactly nb_max_frames for 30s inputs.
-        magnitudes = stft[..., :-1].abs().pow(2.0)  # [n_freqs, n_frames]
+        magnitudes = stft.abs().pow(2.0)  # [n_freqs, n_frames]
+        if magnitudes.shape[-1] > 1:
+            # Keep behavior consistent with WhisperFeatureExtractor for normal-length inputs.
+            magnitudes = magnitudes[..., :-1]
 
         mel_spec = self.mel_filters.T @ magnitudes  # [n_mels, n_frames]
         log_spec = torch.clamp(mel_spec, min=1e-10).log10()
         log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
         log_spec = (log_spec + 4.0) / 4.0  # [n_mels, n_frames]
 
-        # Ensure fixed frame length (right pad if needed, though for fixed n_samples it should match).
-        n_frames = int(log_spec.shape[-1])
-        if n_frames < self.cfg.nb_max_frames:
-            log_spec = torch.nn.functional.pad(log_spec, (0, self.cfg.nb_max_frames - n_frames))
-        elif n_frames > self.cfg.nb_max_frames:
-            log_spec = log_spec[..., : self.cfg.nb_max_frames]
-
-        # For full windows (e.g. 30s chunk), avoid returning an attention mask.
-        # Passing an all-valid mask into SDPA can prevent fast attention kernels.
-        if valid_frames >= self.cfg.nb_max_frames:
-            return log_spec.unsqueeze(0), None
-
-        attn = torch.zeros((self.cfg.nb_max_frames,), device=self.device, dtype=torch.long)
-        if valid_frames > 0:
-            attn[:valid_frames] = 1
-
-        return log_spec.unsqueeze(0), attn.unsqueeze(0)
+        return log_spec.unsqueeze(0), None

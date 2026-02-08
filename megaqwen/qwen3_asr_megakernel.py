@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
+import numpy as np
 import torch
 from safetensors.torch import safe_open
 from transformers import AutoFeatureExtractor, AutoTokenizer
@@ -107,14 +108,18 @@ _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
     # Aggressive flash-decode defaults (can still be overridden by env).
     "MEGAQWEN_SPLIT_ATTN_IMPL": "flash_decode",
     "MEGAQWEN_SPLIT_FLASH_WARPS": "4",
+    "MEGAQWEN_SPLIT_FLASH_PARTS": "1",
     "MEGAQWEN_SPLIT_ATTN_CHUNK": "64",
     "MEGAQWEN_SPLIT_QKV_GEMM_IMPL": "gemmex",
     "MEGAQWEN_SPLIT_KV_LAYOUT": "paged",
     "MEGAQWEN_SPLIT_KV_BLOCK_SIZE": "16",
+    "MEGAQWEN_SPLIT_KV_FP8": "0",
     "MEGAQWEN_SPLIT_QKV_W4": "1",
     "MEGAQWEN_SPLIT_O_W4": "1",
     "MEGAQWEN_SPLIT_FFN_W4": "1",
     "MEGAQWEN_SPLIT_FFN_W4_FUSED": "1",
+    # Long-audio chunking for stable prefill length (seconds per chunk).
+    "MEGAQWEN_ASR_CHUNK_SEC": "60",
     # Debug logs are OFF by default; enable explicitly when profiling internals.
     "MEGAQWEN_DEBUG_PREFILL_STAGE": "0",
     "MEGAQWEN_DEBUG_SPLIT_STAGE": "0",
@@ -126,6 +131,79 @@ _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
 def _apply_asr_megakernel_default_knobs() -> None:
     for key, value in _ASR_MEGAKERNEL_DEFAULT_KNOBS.items():
         os.environ.setdefault(key, value)
+
+
+def _split_audio_into_chunks(
+    wav: np.ndarray,
+    *,
+    sr: int,
+    max_chunk_sec: float,
+    search_expand_sec: float = 5.0,
+    min_window_ms: float = 100.0,
+) -> list[np.ndarray]:
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = np.mean(wav, axis=-1).astype(np.float32)
+    if wav.ndim != 1:
+        raise ValueError(f"Expected mono waveform, got shape={wav.shape}")
+
+    total_len = int(wav.shape[0])
+    if total_len <= 0:
+        return [wav]
+    if max_chunk_sec <= 0:
+        return [wav]
+
+    max_len = max(1, int(float(max_chunk_sec) * float(sr)))
+    if total_len <= max_len:
+        return [wav]
+
+    expand = max(1, int(float(search_expand_sec) * float(sr)))
+    win = max(4, int((float(min_window_ms) / 1000.0) * float(sr)))
+
+    out: list[np.ndarray] = []
+    start = 0
+    while (total_len - start) > max_len:
+        cut = start + max_len
+        left = max(start, cut - expand)
+        right = min(total_len, cut + expand)
+        if right - left <= win:
+            boundary = cut
+        else:
+            seg = wav[left:right]
+            seg_abs = np.abs(seg)
+            window_sums = np.convolve(seg_abs, np.ones(win, dtype=np.float32), mode="valid")
+            min_pos = int(np.argmin(window_sums))
+            wstart = min_pos
+            wend = min_pos + win
+            local = seg_abs[wstart:wend]
+            inner = int(np.argmin(local))
+            boundary = left + wstart + inner
+        boundary = int(max(boundary, start + 1))
+        boundary = int(min(boundary, total_len))
+        out.append(wav[start:boundary].astype(np.float32, copy=False))
+        start = boundary
+    out.append(wav[start:total_len].astype(np.float32, copy=False))
+    return out
+
+
+def _merge_chunk_languages(langs: list[str | None], user_language: str | None) -> str | None:
+    if user_language:
+        return user_language
+    freq: dict[str, int] = {}
+    order: list[str] = []
+    for item in langs:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        if s not in freq:
+            freq[s] = 0
+            order.append(s)
+        freq[s] += 1
+    if not freq:
+        return None
+    return max(order, key=lambda k: (freq[k], -order.index(k)))
 
 
 def _maybe_print_ldg_stage_debug(cycles_cuda: torch.Tensor, *, kernel_ms: float | None = None) -> None:
@@ -505,46 +583,67 @@ class Qwen3ASRMegakernelModel:
         out = generated_cuda[:gen_len].to(device="cpu", non_blocking=False).tolist()
         return [int(x) for x in out], stop_reason
 
+    def _asr_chunk_seconds(self) -> float:
+        s = os.environ.get("MEGAQWEN_ASR_CHUNK_SEC", "")
+        if s.strip() == "":
+            return 60.0
+        try:
+            v = float(s)
+        except Exception:
+            return 60.0
+        if v <= 0:
+            return 0.0
+        return v
+
     @torch.no_grad()
-    def transcribe(
+    def _extract_features(
         self,
-        wav_path: str | Path,
+        audio: np.ndarray,
         *,
-        max_new_tokens: int | None = None,
-        language: str | None = None,
-        return_language: bool = False,
-        timer: StageTimer | None = None,
-    ) -> str | tuple[str | None, str]:
-        timer = timer if timer is not None else StageTimer(enabled=False)
-
-        with timer.cpu("wav_load"):
-            audio, sr = load_wav_mono(wav_path, target_sr=16000)
-
+        sr: int,
+        timer: StageTimer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self._fbank_torch is not None:
             with timer.cuda("feature_extract"):
                 input_features, attention_mask = self._fbank_torch.extract(audio, sampling_rate=sr)
             with timer.cuda("h2d_features"):
                 input_features = input_features.to(dtype=self.dtype)
-        else:
-            with timer.cpu("feature_extract"):
-                feats = self.feature_extractor(
-                    audio,
-                    sampling_rate=sr,
-                    return_attention_mask=True,
-                    return_tensors="pt",
-                )
+            return input_features, attention_mask
 
-            with timer.cuda("h2d_features"):
-                input_features = feats["input_features"].to(self.device, dtype=self.dtype)  # [1, 128, frames]
-                attention_mask = feats.get("attention_mask")
-                if attention_mask is not None:
-                    if int(attention_mask.sum().item()) == int(attention_mask.numel()):
-                        attention_mask = None
-                    else:
-                        attention_mask = attention_mask.to(self.device)
+        with timer.cpu("feature_extract"):
+            feats = self.feature_extractor(
+                audio,
+                sampling_rate=sr,
+                return_attention_mask=True,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+            )
+
+        with timer.cuda("h2d_features"):
+            input_features = feats["input_features"].to(self.device, dtype=self.dtype)
+            attention_mask = feats.get("attention_mask")
+            if attention_mask is not None:
+                if int(attention_mask.sum().item()) == int(attention_mask.numel()):
+                    attention_mask = None
+                else:
+                    attention_mask = attention_mask.to(self.device)
+        return input_features, attention_mask
+
+    @torch.no_grad()
+    def _transcribe_chunk_result(
+        self,
+        audio: np.ndarray,
+        *,
+        sr: int,
+        max_new_tokens: int,
+        language: str | None,
+        timer: StageTimer,
+    ) -> ASRResult:
+        input_features, attention_mask = self._extract_features(audio, sr=sr, timer=timer)
 
         with timer.cuda("audio_tower"):
-            audio_embeds = self.audio_tower(input_features, attention_mask)[0].contiguous()  # [T', hidden]
+            audio_embeds = self.audio_tower(input_features, attention_mask)[0].contiguous()
         t_audio = int(audio_embeds.shape[0])
 
         with timer.cpu("prompt_build"):
@@ -553,14 +652,12 @@ class Qwen3ASRMegakernelModel:
                 system_text="",
                 force_language=language,
             )
-            input_ids = torch.tensor(prompt_ids, dtype=torch.long)  # CPU ok
+            input_ids = torch.tensor(prompt_ids, dtype=torch.long)
 
         self.decoder.reset()
         with timer.cuda("text_prefill"):
             next_token = int(self.decoder.prefill_asr(input_ids, audio_embeds, int(audio_start_idx)))
 
-        # Optional deep debug: instrument one decode token to see stage-level bottlenecks
-        # inside the cooperative LDG decode kernel (no Nsight required).
         if os.environ.get("MEGAQWEN_DEBUG_LDG_STAGE", "0") not in ("", "0", "false", "False"):
             try:
                 if torch.cuda.is_available():
@@ -576,20 +673,34 @@ class Qwen3ASRMegakernelModel:
                     km = None
                 _maybe_print_ldg_stage_debug(cycles, kernel_ms=km)
             finally:
-                # Keep transcription semantics unchanged: redo prefill after the debug token.
                 self.decoder.reset()
                 with timer.cuda("text_prefill"):
                     next_token = int(self.decoder.prefill_asr(input_ids, audio_embeds, int(audio_start_idx)))
 
-        max_new = int(max_new_tokens if max_new_tokens is not None else self.opts.max_new_tokens)
-        generated, _stop = self._decode_greedy_tokens(int(next_token), max_new_tokens=max_new, timer=timer)
-
-        from .qwen3_asr import _parse_asr_output  # avoid duplicating logic
-
+        generated, stop_reason = self._decode_greedy_tokens(int(next_token), max_new_tokens=max_new_tokens, timer=timer)
+        from .qwen3_asr import _parse_asr_output
         with timer.cpu("token_decode"):
             raw = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
         lang, text = _parse_asr_output(raw, user_language=language)
-        return (lang, text) if return_language else text
+        return ASRResult(text=text, language=lang, generated_tokens=len(generated), stop_reason=stop_reason)
+
+    @torch.no_grad()
+    def transcribe(
+        self,
+        wav_path: str | Path,
+        *,
+        max_new_tokens: int | None = None,
+        language: str | None = None,
+        return_language: bool = False,
+        timer: StageTimer | None = None,
+    ) -> str | tuple[str | None, str]:
+        res = self.transcribe_result(
+            wav_path,
+            max_new_tokens=max_new_tokens,
+            language=language,
+            timer=timer,
+        )
+        return (res.language, res.text) if return_language else res.text
 
     @torch.no_grad()
     def transcribe_result(
@@ -605,70 +716,47 @@ class Qwen3ASRMegakernelModel:
         with timer.cpu("wav_load"):
             audio, sr = load_wav_mono(wav_path, target_sr=16000)
 
-        if self._fbank_torch is not None:
-            with timer.cuda("feature_extract"):
-                input_features, attention_mask = self._fbank_torch.extract(audio, sampling_rate=sr)
-            with timer.cuda("h2d_features"):
-                input_features = input_features.to(dtype=self.dtype)
-        else:
-            with timer.cpu("feature_extract"):
-                feats = self.feature_extractor(
-                    audio,
-                    sampling_rate=sr,
-                    return_attention_mask=True,
-                    return_tensors="pt",
-                )
-
-            with timer.cuda("h2d_features"):
-                input_features = feats["input_features"].to(self.device, dtype=self.dtype)
-                attention_mask = feats.get("attention_mask")
-                if attention_mask is not None:
-                    if int(attention_mask.sum().item()) == int(attention_mask.numel()):
-                        attention_mask = None
-                    else:
-                        attention_mask = attention_mask.to(self.device)
-
-        with timer.cuda("audio_tower"):
-            audio_embeds = self.audio_tower(input_features, attention_mask)[0].contiguous()
-        t_audio = int(audio_embeds.shape[0])
-
-        with timer.cpu("prompt_build"):
-            prompt_ids, audio_start_idx = self._build_prompt_ids(
-                audio_token_count=t_audio,
-                system_text="",
-                force_language=language,
-            )
-            input_ids = torch.tensor(prompt_ids, dtype=torch.long)  # CPU ok
-
-        self.decoder.reset()
-        with timer.cuda("text_prefill"):
-            next_token = int(self.decoder.prefill_asr(input_ids, audio_embeds, int(audio_start_idx)))
-
-        if os.environ.get("MEGAQWEN_DEBUG_LDG_STAGE", "0") not in ("", "0", "false", "False"):
-            try:
-                if torch.cuda.is_available():
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    cycles = self.decoder.debug_ldg_decode_cycles(int(next_token))
-                    end.record()
-                    torch.cuda.synchronize()
-                    km = float(start.elapsed_time(end))
-                else:
-                    cycles = self.decoder.debug_ldg_decode_cycles(int(next_token))
-                    km = None
-                _maybe_print_ldg_stage_debug(cycles, kernel_ms=km)
-            finally:
-                self.decoder.reset()
-                with timer.cuda("text_prefill"):
-                    next_token = int(self.decoder.prefill_asr(input_ids, audio_embeds, int(audio_start_idx)))
-
         max_new = int(max_new_tokens if max_new_tokens is not None else self.opts.max_new_tokens)
-        generated, stop_reason = self._decode_greedy_tokens(int(next_token), max_new_tokens=max_new, timer=timer)
+        chunk_sec = self._asr_chunk_seconds()
+        chunks: list[np.ndarray]
+        if chunk_sec > 0.0:
+            with timer.cpu("chunk_split"):
+                chunks = _split_audio_into_chunks(audio, sr=sr, max_chunk_sec=chunk_sec)
+        else:
+            chunks = [np.asarray(audio, dtype=np.float32)]
 
-        from .qwen3_asr import _parse_asr_output  # avoid duplicating logic
+        results: list[ASRResult] = []
+        pending: list[np.ndarray] = [np.asarray(c, dtype=np.float32, copy=False) for c in chunks]
+        min_samples_to_split = max(int(sr), 2)
+        while pending:
+            piece = pending.pop(0)
+            try:
+                result = self._transcribe_chunk_result(
+                    piece,
+                    sr=sr,
+                    max_new_tokens=max_new,
+                    language=language,
+                    timer=timer,
+                )
+                results.append(result)
+            except RuntimeError as exc:
+                msg = str(exc)
+                can_split = (
+                    ("Prefill sequence length exceeds maximum" in msg)
+                    or ("decode_steps would exceed max_seq_len" in msg)
+                    or ("decode_steps_cuda_graph would exceed max_seq_len" in msg)
+                )
+                if can_split and int(piece.shape[0]) > min_samples_to_split:
+                    mid = int(piece.shape[0] // 2)
+                    if mid <= 0 or mid >= int(piece.shape[0]):
+                        raise
+                    pending.insert(0, piece[mid:])
+                    pending.insert(0, piece[:mid])
+                    continue
+                raise
 
-        with timer.cpu("token_decode"):
-            raw = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
-        lang, text = _parse_asr_output(raw, user_language=language)
-        return ASRResult(text=text, language=lang, generated_tokens=len(generated), stop_reason=stop_reason)
+        merged_text = "".join(r.text for r in results if r.text)
+        merged_lang = _merge_chunk_languages([r.language for r in results], user_language=language)
+        merged_tokens = int(sum(int(r.generated_tokens) for r in results))
+        merged_stop = "max_new_tokens" if any(r.stop_reason != "eos" for r in results) else "eos"
+        return ASRResult(text=merged_text, language=merged_lang, generated_tokens=merged_tokens, stop_reason=merged_stop)

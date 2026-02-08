@@ -345,6 +345,8 @@ class Qwen3ASRModel:
                     sampling_rate=sr,
                     return_attention_mask=True,
                     return_tensors="pt",
+                    padding=True,
+                    truncation=False,
                 )
 
             # H2D copy is async; use CUDA events for more realistic timing.
@@ -449,6 +451,8 @@ class Qwen3ASRModel:
                     sampling_rate=sr,
                     return_attention_mask=True,
                     return_tensors="pt",
+                    padding=True,
+                    truncation=False,
                 )
             with timer.cuda("h2d_features"):
                 input_features = feats["input_features"].to(self.device, dtype=self.dtype)

@@ -15,6 +15,8 @@
 #include "config.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp8.hpp>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -67,6 +69,147 @@ __device__ __forceinline__ int kv_cache_physical_token(
     return physical_block * kv_block_size + in_block;
 }
 
+__device__ __forceinline__ float kv_fp8_max_abs_scale(float amax) {
+    constexpr float kFp8E4M3Max = 448.0f;
+    if (amax < 1.0e-8f) return 1.0f;
+    return amax / kFp8E4M3Max;
+}
+
+__device__ __forceinline__ float kv_cache_load_elem(
+    const __nv_bfloat16* __restrict__ bf16_vec,
+    const __nv_fp8_e4m3* __restrict__ fp8_vec,
+    int d,
+    float scale,
+    int fp8_enabled
+) {
+    if (fp8_enabled) {
+        return static_cast<float>(fp8_vec[d]) * scale;
+    }
+    return __bfloat162float(bf16_vec[d]);
+}
+
+// Quantize existing BF16 KV cache into FP8 cache for [start_pos, end_pos).
+// - k/v scale shape: [num_layers, num_kv_heads] (one scale per layer/head)
+// - k/v fp8 shape:   [num_layers, num_kv_heads, max_seq_len, head_dim]
+__global__ void split_quantize_kv_cache_fp8_kernel(
+    const __nv_bfloat16* __restrict__ k_cache_bf16,
+    const __nv_bfloat16* __restrict__ v_cache_bf16,
+    __nv_fp8_e4m3* __restrict__ k_cache_fp8,
+    __nv_fp8_e4m3* __restrict__ v_cache_fp8,
+    float* __restrict__ k_scale_cache,
+    float* __restrict__ v_scale_cache,
+    int num_layers,
+    int num_kv_heads,
+    int max_seq_len,
+    int head_dim,
+    int start_pos,
+    int end_pos
+) {
+    if (head_dim != HEAD_DIM) return;
+    int span = end_pos - start_pos;
+    if (span <= 0) return;
+    int idx = (int)blockIdx.x;
+    int total = num_layers * num_kv_heads;
+    if (idx >= total) return;
+
+    int kv_head = idx % num_kv_heads;
+    int layer = idx / num_kv_heads;
+    int base = (layer * num_kv_heads + kv_head) * max_seq_len * HEAD_DIM;
+    float* k_scale_ptr = k_scale_cache + (layer * num_kv_heads + kv_head);
+    float* v_scale_ptr = v_scale_cache + (layer * num_kv_heads + kv_head);
+
+    float local_k_max = 0.0f;
+    float local_v_max = 0.0f;
+    for (int t = start_pos; t < end_pos; t++) {
+        int row = base + t * HEAD_DIM;
+        for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
+            float kf = fabsf(__bfloat162float(k_cache_bf16[row + d]));
+            float vf = fabsf(__bfloat162float(v_cache_bf16[row + d]));
+            if (kf > local_k_max) local_k_max = kf;
+            if (vf > local_v_max) local_v_max = vf;
+        }
+    }
+    local_k_max = warp_reduce_max(local_k_max);
+    local_v_max = warp_reduce_max(local_v_max);
+
+    __shared__ float sm_k_max[8];
+    __shared__ float sm_v_max[8];
+    __shared__ float sm_k_scale;
+    __shared__ float sm_v_scale;
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        sm_k_max[warp] = local_k_max;
+        sm_v_max[warp] = local_v_max;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float kmax = (lane < (blockDim.x / WARP_SIZE)) ? sm_k_max[lane] : 0.0f;
+        float vmax = (lane < (blockDim.x / WARP_SIZE)) ? sm_v_max[lane] : 0.0f;
+        kmax = warp_reduce_max(kmax);
+        vmax = warp_reduce_max(vmax);
+        if (lane == 0) {
+            sm_k_scale = kv_fp8_max_abs_scale(kmax);
+            sm_v_scale = kv_fp8_max_abs_scale(vmax);
+            *k_scale_ptr = sm_k_scale;
+            *v_scale_ptr = sm_v_scale;
+        }
+    }
+    __syncthreads();
+
+    float inv_k = 1.0f / sm_k_scale;
+    float inv_v = 1.0f / sm_v_scale;
+    for (int t = start_pos; t < end_pos; t++) {
+        int row = base + t * HEAD_DIM;
+        for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
+            float kf = __bfloat162float(k_cache_bf16[row + d]) * inv_k;
+            float vf = __bfloat162float(v_cache_bf16[row + d]) * inv_v;
+            k_cache_fp8[row + d] = __nv_fp8_e4m3(kf);
+            v_cache_fp8[row + d] = __nv_fp8_e4m3(vf);
+        }
+    }
+}
+
+extern "C" void launch_split_quantize_kv_cache_fp8(
+    const void* k_cache_bf16,
+    const void* v_cache_bf16,
+    void* k_cache_fp8,
+    void* v_cache_fp8,
+    void* k_scale_cache,
+    void* v_scale_cache,
+    int num_layers,
+    int num_kv_heads,
+    int max_seq_len,
+    int head_dim,
+    int start_pos,
+    int end_pos,
+    cudaStream_t stream
+) {
+    if (k_cache_bf16 == nullptr || v_cache_bf16 == nullptr ||
+        k_cache_fp8 == nullptr || v_cache_fp8 == nullptr ||
+        k_scale_cache == nullptr || v_scale_cache == nullptr) {
+        return;
+    }
+    int span = end_pos - start_pos;
+    if (span <= 0) return;
+    int blocks = num_layers * num_kv_heads;
+    if (blocks <= 0) return;
+    split_quantize_kv_cache_fp8_kernel<<<blocks, 128, 0, stream>>>(
+        (const __nv_bfloat16*)k_cache_bf16,
+        (const __nv_bfloat16*)v_cache_bf16,
+        (__nv_fp8_e4m3*)k_cache_fp8,
+        (__nv_fp8_e4m3*)v_cache_fp8,
+        (float*)k_scale_cache,
+        (float*)v_scale_cache,
+        num_layers,
+        num_kv_heads,
+        max_seq_len,
+        head_dim,
+        start_pos,
+        end_pos
+    );
+}
+
 // Specialized for a single query token (seq_len=1).
 // Grid: (max(num_q_heads, num_kv_heads)), Block: 128
 __global__ void decode_qk_norm_rope_cache_kernel(
@@ -79,6 +222,11 @@ __global__ void decode_qk_norm_rope_cache_kernel(
     const __nv_bfloat16* __restrict__ sin_table,      // [max_seq, head_dim]
     __nv_bfloat16* __restrict__ k_cache,  // [num_kv_heads, max_seq_len, head_dim]
     __nv_bfloat16* __restrict__ v_cache,  // [num_kv_heads, max_seq_len, head_dim]
+    __nv_fp8_e4m3* __restrict__ k_cache_fp8,  // optional [num_kv_heads, max_seq_len, head_dim]
+    __nv_fp8_e4m3* __restrict__ v_cache_fp8,  // optional [num_kv_heads, max_seq_len, head_dim]
+    float* __restrict__ k_scale_cache,        // optional [num_kv_heads]
+    float* __restrict__ v_scale_cache,        // optional [num_kv_heads]
+    int kv_fp8_enabled,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -148,6 +296,22 @@ __global__ void decode_qk_norm_rope_cache_kernel(
         if (position_physical >= max_seq_len) return;
         __nv_bfloat16* k_cache_head = k_cache + head * max_seq_len * head_dim + position_physical * head_dim;
         __nv_bfloat16* v_cache_head = v_cache + head * max_seq_len * head_dim + position_physical * head_dim;
+        __nv_fp8_e4m3* k_cache_head_fp8 = nullptr;
+        __nv_fp8_e4m3* v_cache_head_fp8 = nullptr;
+        float* k_scale_ptr = nullptr;
+        float* v_scale_ptr = nullptr;
+        float k_scale = 1.0f;
+        float v_scale = 1.0f;
+        if (kv_fp8_enabled) {
+            k_cache_head_fp8 = k_cache_fp8 + head * max_seq_len * head_dim + position_physical * head_dim;
+            v_cache_head_fp8 = v_cache_fp8 + head * max_seq_len * head_dim + position_physical * head_dim;
+            k_scale_ptr = k_scale_cache + head;
+            v_scale_ptr = v_scale_cache + head;
+            k_scale = *k_scale_ptr;
+            v_scale = *v_scale_ptr;
+            if (k_scale < 1.0e-8f) k_scale = 1.0f;
+            if (v_scale < 1.0e-8f) v_scale = 1.0f;
+        }
 
         float sum_sq = 0.0f;
         for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
@@ -178,10 +342,22 @@ __global__ void decode_qk_norm_rope_cache_kernel(
             float out;
             if (i < head_dim / 2) out = smem_normed[i] * cos_v - pair_v * sin_v;
             else out = pair_v * sin_v + smem_normed[i] * cos_v;
+            smem_normed[i] = out;
+        }
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float out = smem_normed[i];
             __nv_bfloat16 out_bf16 = __float2bfloat16(out);
             k_head[i] = out_bf16;
             k_cache_head[i] = out_bf16;
-            v_cache_head[i] = v_head[i];
+            __nv_bfloat16 vv_bf16 = v_head[i];
+            v_cache_head[i] = vv_bf16;
+            if (kv_fp8_enabled) {
+                float inv_ks = 1.0f / k_scale;
+                float inv_vs = 1.0f / v_scale;
+                float vv = __bfloat162float(vv_bf16);
+                k_cache_head_fp8[i] = __nv_fp8_e4m3(out * inv_ks);
+                v_cache_head_fp8[i] = __nv_fp8_e4m3(vv * inv_vs);
+            }
         }
     }
 }
@@ -192,6 +368,11 @@ __global__ void decode_attention_cache_legacy_kernel(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim] (already norm+rope)
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
+    const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
+    int kv_fp8_enabled,
     __nv_bfloat16* __restrict__ out,                 // [num_q_heads, head_dim]
     int num_q_heads,
     int num_kv_heads,
@@ -231,18 +412,27 @@ __global__ void decode_attention_cache_legacy_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * head_dim;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
+    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
+    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
+    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
+    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
+    if (k_scale < 1.0e-8f) k_scale = 1.0f;
+    if (v_scale < 1.0e-8f) v_scale = 1.0f;
 
     for (int t = 0; t < cache_len; t++) {
         int physical_t = kv_cache_physical_token(t, kv_block_table, kv_block_size);
         if (physical_t >= max_seq_len) continue;
         const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
         const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
-
+        const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * head_dim) : nullptr;
+        const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * head_dim) : nullptr;
         float dot = 0.0f;
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_LANE; i++) {
             int d = lane_id + i * WARP_SIZE;
-            dot += q_local[i] * __bfloat162float(k_vec[d]);
+            dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
         }
         dot = warp_reduce_sum(dot) * attn_scale;
         float score = __shfl_sync(0xffffffff, dot, 0);
@@ -255,7 +445,7 @@ __global__ void decode_attention_cache_legacy_kernel(
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_LANE; i++) {
             int d = lane_id + i * WARP_SIZE;
-            float vv = __bfloat162float(v_vec[d]);
+            float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
             out_local[i] = out_local[i] * old_scale + vv * new_scale;
         }
         m = m_new;
@@ -276,6 +466,11 @@ __global__ void decode_attention_cache_splitk_kernel(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
+    const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
+    int kv_fp8_enabled,
     __nv_bfloat16* __restrict__ out,                 // [num_q_heads, head_dim]
     int num_q_heads,
     int num_kv_heads,
@@ -338,18 +533,27 @@ __global__ void decode_attention_cache_splitk_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * head_dim;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
+    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
+    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
+    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
+    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
+    if (k_scale < 1.0e-8f) k_scale = 1.0f;
+    if (v_scale < 1.0e-8f) v_scale = 1.0f;
 
     for (int t = warp_id; t < cache_len; t += active_warps) {
         int physical_t = kv_cache_physical_token(t, kv_block_table, kv_block_size);
         if (physical_t >= max_seq_len) continue;
         const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
         const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
-
+        const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * head_dim) : nullptr;
+        const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * head_dim) : nullptr;
         float dot = 0.0f;
         #pragma unroll
         for (int i = 0; i < kElemsPerLane; i++) {
             int d = lane_id + i * WARP_SIZE;
-            dot += q_local[i] * __bfloat162float(k_vec[d]);
+            dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
         }
         dot = warp_reduce_sum(dot) * attn_scale;
         float score = __shfl_sync(0xffffffff, dot, 0);
@@ -362,7 +566,7 @@ __global__ void decode_attention_cache_splitk_kernel(
         #pragma unroll
         for (int i = 0; i < kElemsPerLane; i++) {
             int d = lane_id + i * WARP_SIZE;
-            float vv = __bfloat162float(v_vec[d]);
+            float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
             out_local[i] = out_local[i] * old_scale + vv * new_scale;
         }
         m = m_new;
@@ -412,6 +616,11 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
+    const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
+    int kv_fp8_enabled,
     float* __restrict__ partial_m,                   // [max_chunks, num_q_heads]
     float* __restrict__ partial_s,                   // [max_chunks, num_q_heads]
     float* __restrict__ partial_out,                 // [max_chunks, num_q_heads, head_dim]
@@ -483,6 +692,14 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * head_dim;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
+    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
+    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
+    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
+    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
+    if (k_scale < 1.0e-8f) k_scale = 1.0f;
+    if (v_scale < 1.0e-8f) v_scale = 1.0f;
 
     if (warp_id < active_warps) {
         for (int t = t_start + warp_id; t < t_end; t += active_warps) {
@@ -490,12 +707,13 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
             if (physical_t >= max_seq_len) continue;
             const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
             const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
-
+            const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * head_dim) : nullptr;
+            const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * head_dim) : nullptr;
             float dot = 0.0f;
             #pragma unroll
             for (int i = 0; i < kElemsPerLane; i++) {
                 int d = lane_id + i * WARP_SIZE;
-                dot += q_local[i] * __bfloat162float(k_vec[d]);
+                dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
             }
             dot = warp_reduce_sum(dot) * attn_scale;
             float score = __shfl_sync(0xffffffff, dot, 0);
@@ -508,7 +726,7 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
             #pragma unroll
             for (int i = 0; i < kElemsPerLane; i++) {
                 int d = lane_id + i * WARP_SIZE;
-                float vv = __bfloat162float(v_vec[d]);
+                float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
                 out_local[i] = out_local[i] * old_scale + vv * new_scale;
             }
             m = m_new;
@@ -575,6 +793,11 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
+    const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
+    int kv_fp8_enabled,
     float* __restrict__ partial_m,                   // [max_chunks, num_q_heads]
     float* __restrict__ partial_s,                   // [max_chunks, num_q_heads]
     float* __restrict__ partial_out,                 // [max_chunks, num_q_heads, head_dim]
@@ -584,12 +807,13 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     int max_seq_len,
     float attn_scale,
     int warps_per_head,
+    int partitions_per_chunk,
     int chunk_size,
     int max_chunks,
     const int* __restrict__ kv_block_table,
     int kv_block_size,
     const int* __restrict__ position_ptr,
-    SplitFlashDecodeDebugRec* __restrict__ debug_out // optional [max_chunks, num_q_heads]
+    SplitFlashDecodeDebugRec* __restrict__ debug_out // optional [partitions_per_chunk, max_chunks, num_q_heads]
 ) {
     constexpr int kMaxWarps = 8;
     constexpr int kElemsPerLane = HEAD_DIM / WARP_SIZE;
@@ -610,10 +834,15 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     if (head_dim != HEAD_DIM) return;
     if (chunk_size <= 0 || max_chunks <= 0) return;
     if (num_q_heads <= 0 || num_kv_heads <= 0) return;
+    if (partitions_per_chunk <= 0) return;
 
-    int q_head = (int)(blockIdx.x % num_q_heads);
-    int chunk_idx = (int)(blockIdx.x / num_q_heads);
+    int block_linear = (int)blockIdx.x;
+    int q_head = block_linear % num_q_heads;
+    int tmp = block_linear / num_q_heads;
+    int chunk_idx = tmp % max_chunks;
+    int part_idx = tmp / max_chunks;
     if (chunk_idx >= max_chunks) return;
+    if (part_idx >= partitions_per_chunk) return;
 
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -621,15 +850,23 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     int position = *position_ptr;
     int cache_len = position + 1;
     if (cache_len > max_seq_len) cache_len = max_seq_len;
-    int t_start = chunk_idx * chunk_size;
-    if (t_start >= cache_len) return;
-    int t_end = t_start + chunk_size;
-    if (t_end > cache_len) t_end = cache_len;
+    int chunk_start = chunk_idx * chunk_size;
+    if (chunk_start >= cache_len) return;
+    int chunk_end = chunk_start + chunk_size;
+    if (chunk_end > cache_len) chunk_end = cache_len;
+    int chunk_tokens = chunk_end - chunk_start;
+    int part_tokens = (chunk_tokens + partitions_per_chunk - 1) / partitions_per_chunk;
+    int t_start = chunk_start + part_idx * part_tokens;
+    int t_end = t_start + part_tokens;
+    if (t_start < chunk_start) t_start = chunk_start;
+    if (t_end > chunk_end) t_end = chunk_end;
+    if (t_start > chunk_end) t_start = chunk_end;
+    if (t_end < t_start) t_end = t_start;
 
     int active_warps = warps_per_head;
     if (active_warps > kMaxWarps) active_warps = kMaxWarps;
-    int chunk_tokens = t_end - t_start;
-    if (active_warps > chunk_tokens) active_warps = chunk_tokens;
+    int local_tokens_span = t_end - t_start;
+    if (active_warps > local_tokens_span) active_warps = local_tokens_span;
     if (active_warps <= 0) active_warps = 1;
     if (threadIdx.x == 0) {
         sm_active_warps = active_warps;
@@ -663,6 +900,14 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * head_dim;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
+    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
+    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
+    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
+    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
+    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
+    if (k_scale < 1.0e-8f) k_scale = 1.0f;
+    if (v_scale < 1.0e-8f) v_scale = 1.0f;
     bool paged = (kv_block_table != nullptr && kv_block_size > 0);
     bool use_blocking = (kv_block_size > 0);
 
@@ -713,12 +958,13 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
 
                     const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
                     const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
-
+                    const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * head_dim) : nullptr;
+                    const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * head_dim) : nullptr;
                     float dot = 0.0f;
                     #pragma unroll
                     for (int i = 0; i < kElemsPerLane; i++) {
                         int d = lane_id + i * WARP_SIZE;
-                        dot += q_local[i] * __bfloat162float(k_vec[d]);
+                        dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
                     }
                     dot = warp_reduce_sum(dot) * attn_scale;
                     float score = __shfl_sync(0xffffffff, dot, 0);
@@ -731,7 +977,7 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
                     #pragma unroll
                     for (int i = 0; i < kElemsPerLane; i++) {
                         int d = lane_id + i * WARP_SIZE;
-                        float vv = __bfloat162float(v_vec[d]);
+                        float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
                         out_local[i] = out_local[i] * old_scale + vv * new_scale;
                     }
                     m = m_new;
@@ -771,7 +1017,7 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     }
     __syncthreads();
 
-    int idx = chunk_idx * num_q_heads + q_head;
+    int idx = (part_idx * max_chunks + chunk_idx) * num_q_heads + q_head;
     #pragma unroll
     for (int i = 0; i < kElemsPerLane; i++) {
         int d = lane_id + i * WARP_SIZE;
@@ -796,6 +1042,58 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
             rec.tiles_processed = sm_tiles;
             debug_out[idx] = rec;
         }
+    }
+}
+
+__global__ void decode_attention_cache_flash_reduce_parts_kernel(
+    const float* __restrict__ part_m,          // [parts, max_chunks, num_q_heads]
+    const float* __restrict__ part_s,          // [parts, max_chunks, num_q_heads]
+    const float* __restrict__ part_out,        // [parts, max_chunks, num_q_heads, head_dim]
+    float* __restrict__ chunk_m,               // [max_chunks, num_q_heads]
+    float* __restrict__ chunk_s,               // [max_chunks, num_q_heads]
+    float* __restrict__ chunk_out,             // [max_chunks, num_q_heads, head_dim]
+    int num_q_heads,
+    int head_dim,
+    int max_chunks,
+    int partitions_per_chunk,
+    int chunk_size,
+    const int* __restrict__ position_ptr
+) {
+    if (head_dim != HEAD_DIM) return;
+    if (partitions_per_chunk <= 0 || chunk_size <= 0 || max_chunks <= 0) return;
+    int q_head = (int)(blockIdx.x % num_q_heads);
+    int chunk_idx = (int)(blockIdx.x / num_q_heads);
+    if (chunk_idx >= max_chunks) return;
+
+    int position = *position_ptr;
+    int cache_len = position + 1;
+    int num_chunks = (cache_len + chunk_size - 1) / chunk_size;
+    if (num_chunks > max_chunks) num_chunks = max_chunks;
+    if (chunk_idx >= num_chunks) return;
+
+    int chunk_base = chunk_idx * num_q_heads + q_head;
+    float g_m = -INFINITY;
+    for (int p = 0; p < partitions_per_chunk; p++) {
+        int idx = (p * max_chunks + chunk_idx) * num_q_heads + q_head;
+        g_m = fmaxf(g_m, part_m[idx]);
+    }
+    float g_s = 0.0f;
+    for (int p = 0; p < partitions_per_chunk; p++) {
+        int idx = (p * max_chunks + chunk_idx) * num_q_heads + q_head;
+        g_s += part_s[idx] * expf(part_m[idx] - g_m);
+    }
+    for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p < partitions_per_chunk; p++) {
+            int idx = (p * max_chunks + chunk_idx) * num_q_heads + q_head;
+            float scale = expf(part_m[idx] - g_m);
+            acc += part_out[idx * HEAD_DIM + d] * scale;
+        }
+        chunk_out[chunk_base * HEAD_DIM + d] = acc;
+    }
+    if (threadIdx.x == 0) {
+        chunk_m[chunk_base] = g_m;
+        chunk_s[chunk_base] = g_s;
     }
 }
 
@@ -868,6 +1166,11 @@ __global__ void decode_attention_cache_flash_decode_kernel(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
+    const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
+    int kv_fp8_enabled,
     __nv_bfloat16* __restrict__ out,                 // [num_q_heads, head_dim]
     int num_q_heads,
     int num_kv_heads,
@@ -947,6 +1250,14 @@ __global__ void decode_attention_cache_flash_decode_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * HEAD_DIM;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * HEAD_DIM;
+    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * HEAD_DIM) : nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * HEAD_DIM) : nullptr;
+    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
+    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
+    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
+    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
+    if (k_scale < 1.0e-8f) k_scale = 1.0f;
+    if (v_scale < 1.0e-8f) v_scale = 1.0f;
     bool paged = (kv_block_table != nullptr && kv_block_size > 0);
 
     int cached_logical_block = -1;
@@ -983,12 +1294,13 @@ __global__ void decode_attention_cache_flash_decode_kernel(
 
             const __nv_bfloat16* k_vec = k_base + physical_t * HEAD_DIM;
             const __nv_bfloat16* v_vec = v_base + physical_t * HEAD_DIM;
-
+            const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * HEAD_DIM) : nullptr;
+            const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * HEAD_DIM) : nullptr;
             float dot = 0.0f;
             #pragma unroll
             for (int i = 0; i < kElemsPerLane; i++) {
                 int d = lane_id + i * WARP_SIZE;
-                dot += q_local[i] * __bfloat162float(k_vec[d]);
+                dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
             }
             dot = warp_reduce_sum(dot) * attn_scale;
             float score = __shfl_sync(0xffffffff, dot, 0);
@@ -1001,7 +1313,7 @@ __global__ void decode_attention_cache_flash_decode_kernel(
             #pragma unroll
             for (int i = 0; i < kElemsPerLane; i++) {
                 int d = lane_id + i * WARP_SIZE;
-                float vv = __bfloat162float(v_vec[d]);
+                float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
                 out_local[i] = out_local[i] * old_scale + vv * new_scale;
             }
             m = m_new;

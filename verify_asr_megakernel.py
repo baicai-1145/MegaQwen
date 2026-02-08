@@ -95,6 +95,7 @@ def main() -> None:
         "MEGAQWEN_DEBUG_PREFILL_STAGE_SKIP=" + os.environ.get("MEGAQWEN_DEBUG_PREFILL_STAGE_SKIP", ""),
         "MEGAQWEN_DECODE_BACKEND=" + os.environ.get("MEGAQWEN_DECODE_BACKEND", ""),
         "MEGAQWEN_DECODE_GPU_LOOP=" + os.environ.get("MEGAQWEN_DECODE_GPU_LOOP", ""),
+        "MEGAQWEN_ASR_CHUNK_SEC=" + os.environ.get("MEGAQWEN_ASR_CHUNK_SEC", ""),
         "MEGAQWEN_DECODE_V2_CHECK_STRIDE=" + os.environ.get("MEGAQWEN_DECODE_V2_CHECK_STRIDE", ""),
         "MEGAQWEN_SPLIT_GEMM_IMPL=" + os.environ.get("MEGAQWEN_SPLIT_GEMM_IMPL", ""),
         "MEGAQWEN_SPLIT_O_GEMM_IMPL=" + os.environ.get("MEGAQWEN_SPLIT_O_GEMM_IMPL", ""),

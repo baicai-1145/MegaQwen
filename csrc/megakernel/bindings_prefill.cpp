@@ -9,6 +9,17 @@
 #include <cstring>
 #include <cstdio>
 
+static inline bool _env_enabled(const char* name, bool default_on = false) {
+    const char* s = std::getenv(name);
+    if (s == nullptr || std::strcmp(s, "") == 0) return default_on;
+    if (std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        return false;
+    }
+    return true;
+}
+
 // Must match the struct in fused_prefill.cu
 struct PrefillLayerWeights {
     const void* input_layernorm_weight;
@@ -194,6 +205,11 @@ extern "C" void launch_split_decode_gemm(
     const void* sin_table,
     void* k_cache,
     void* v_cache,
+    void* k_cache_fp8,
+    void* v_cache_fp8,
+    void* k_scale_cache,
+    void* v_scale_cache,
+    int kv_fp8_enabled,
     void* split_attn_partial_m,
     void* split_attn_partial_s,
     void* split_attn_partial_out,
@@ -220,6 +236,21 @@ extern "C" void launch_split_decode_gemm(
     cublasLtHandle_t cublaslt_handle,
     void* cublaslt_workspace,
     size_t cublaslt_workspace_bytes,
+    cudaStream_t stream
+);
+extern "C" void launch_split_quantize_kv_cache_fp8(
+    const void* k_cache_bf16,
+    const void* v_cache_bf16,
+    void* k_cache_fp8,
+    void* v_cache_fp8,
+    void* k_scale_cache,
+    void* v_scale_cache,
+    int num_layers,
+    int num_kv_heads,
+    int max_seq_len,
+    int head_dim,
+    int start_pos,
+    int end_pos,
     cudaStream_t stream
 );
 extern "C" void split_debug_stage_reset();
@@ -454,6 +485,8 @@ public:
                 int v = std::atoi(s);
                 if (v > 0) split_kv_block_size_ = v;
             }
+            split_kv_fp8_enabled_ = _env_enabled("MEGAQWEN_SPLIT_KV_FP8", false);
+            split_kv_fp8_ready_len_ = 0;
 
             // Build packed weights for split backend:
             // QKV:   [4096, 1024] = cat([Q, K, V], dim=0)
@@ -492,6 +525,31 @@ public:
                     {split_attn_max_chunks_, 16, 128},
                     torch::dtype(torch::kFloat32).device(torch::kCUDA)
                 );
+                if (split_kv_fp8_enabled_) {
+                    split_k_cache_fp8_ = torch::zeros(
+                        {num_layers_, 8, max_seq_len_, 128},
+                        torch::dtype(torch::kUInt8).device(torch::kCUDA)
+                    );
+                    split_v_cache_fp8_ = torch::zeros(
+                        {num_layers_, 8, max_seq_len_, 128},
+                        torch::dtype(torch::kUInt8).device(torch::kCUDA)
+                    );
+                    split_k_scale_cache_ = torch::ones(
+                        {num_layers_, 8},
+                        torch::dtype(torch::kFloat32).device(torch::kCUDA)
+                    );
+                    split_v_scale_cache_ = torch::ones(
+                        {num_layers_, 8},
+                        torch::dtype(torch::kFloat32).device(torch::kCUDA)
+                    );
+                    std::printf("[MEGAQWEN_SPLIT] kv cache fp8 enabled (layout=%s)\n",
+                                split_kv_paged_ ? "paged" : "contiguous");
+                } else {
+                    split_k_cache_fp8_ = torch::Tensor();
+                    split_v_cache_fp8_ = torch::Tensor();
+                    split_k_scale_cache_ = torch::Tensor();
+                    split_v_scale_cache_ = torch::Tensor();
+                }
                 if (split_kv_paged_) {
                     split_kv_num_blocks_ = (max_seq_len_ + split_kv_block_size_ - 1) / split_kv_block_size_;
                     if (split_kv_num_blocks_ < 1) split_kv_num_blocks_ = 1;
@@ -745,6 +803,7 @@ public:
         }
 
         position_ = seq_len;
+        split_kv_fp8_ready_len_ = 0;
         return output_token_.item<int>();
     }
 
@@ -863,6 +922,7 @@ public:
         }
 
         position_ = seq_len;
+        split_kv_fp8_ready_len_ = 0;
         return output_token_.item<int>();
     }
 
@@ -870,6 +930,7 @@ public:
         cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
         cudaMemcpyAsync(input_token_.data_ptr(), &input_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(position_token_.data_ptr(), &position_, sizeof(int), cudaMemcpyHostToDevice, stream);
+        ensure_split_kv_fp8_ready(position_, stream);
 
         launch_decode_step_backend(
             (const int*)input_token_.data_ptr(),
@@ -879,6 +940,9 @@ public:
         );
 
         position_++;
+        if (split_kv_fp8_enabled_ && split_kv_fp8_ready_len_ < position_) {
+            split_kv_fp8_ready_len_ = position_;
+        }
         return output_token_.item<int>();
     }
 
@@ -966,6 +1030,7 @@ public:
         int* pos_ptr = (int*)positions.data_ptr();
         cudaMemcpyAsync(tokens_ptr, &first_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
         launch_ldg_fill_iota(pos_ptr, position_, num_steps, stream);
+        ensure_split_kv_fp8_ready(position_, stream);
 
         for (int i = 0; i < num_steps; i++) {
             const int* in_ptr = (const int*)(tokens_ptr + i);
@@ -975,6 +1040,9 @@ public:
         }
 
         position_ += num_steps;
+        if (split_kv_fp8_enabled_ && split_kv_fp8_ready_len_ < position_) {
+            split_kv_fp8_ready_len_ = position_;
+        }
         return tokens.slice(0, 1, num_steps + 1);
     }
 
@@ -1102,6 +1170,7 @@ public:
 
         // Initialize next token (H2D once).
         cudaMemcpyAsync(greedy_next_token_.data_ptr(), &first_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
+        ensure_split_kv_fp8_ready(position_, stream);
 
         auto out = torch::empty({max_new}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         int* out_ptr = (int*)out.data_ptr();
@@ -1155,6 +1224,9 @@ public:
                 cudaMemcpyAsync(out_ptr + gen_len, tokens_ptr, sizeof(int) * steps, cudaMemcpyDeviceToDevice, stream);
 
                 position_ += steps;
+                if (split_kv_fp8_enabled_ && split_kv_fp8_ready_len_ < position_) {
+                    split_kv_fp8_ready_len_ = position_;
+                }
                 gen_len += steps;
                 chunks_since_check += 1;
 
@@ -1225,6 +1297,9 @@ public:
 
                 // KV cache already advanced by `steps` due to launched kernels; keep position_ consistent.
                 position_ += steps;
+                if (split_kv_fp8_enabled_ && split_kv_fp8_ready_len_ < position_) {
+                    split_kv_fp8_ready_len_ = position_;
+                }
 
                 if (stop_pos >= 0) {
                     gen_len += stop_pos;
@@ -1251,14 +1326,50 @@ public:
 
     void reset() {
         position_ = 0;
+        split_kv_fp8_ready_len_ = 0;
         k_cache_.zero_();
         v_cache_.zero_();
+        if (split_k_cache_fp8_.defined()) split_k_cache_fp8_.zero_();
+        if (split_v_cache_fp8_.defined()) split_v_cache_fp8_.zero_();
+        if (split_k_scale_cache_.defined()) split_k_scale_cache_.fill_(1.0f);
+        if (split_v_scale_cache_.defined()) split_v_scale_cache_.fill_(1.0f);
     }
 
     int position() const { return position_; }
 
     torch::Tensor get_k_cache() const { return k_cache_; }
     torch::Tensor get_v_cache() const { return v_cache_; }
+
+    void ensure_split_kv_fp8_ready(int upto_pos_exclusive, cudaStream_t stream) {
+        if (decode_backend_ == 0) return;
+        if (!split_kv_fp8_enabled_) return;
+        if (!split_k_cache_fp8_.defined() || !split_v_cache_fp8_.defined() ||
+            !split_k_scale_cache_.defined() || !split_v_scale_cache_.defined()) {
+            return;
+        }
+        int end = upto_pos_exclusive;
+        if (end < 0) end = 0;
+        if (end > max_seq_len_) end = max_seq_len_;
+        int start = split_kv_fp8_ready_len_;
+        if (start < 0) start = 0;
+        if (start >= end) return;
+        launch_split_quantize_kv_cache_fp8(
+            k_cache_.data_ptr(),
+            v_cache_.data_ptr(),
+            split_k_cache_fp8_.data_ptr(),
+            split_v_cache_fp8_.data_ptr(),
+            split_k_scale_cache_.data_ptr(),
+            split_v_scale_cache_.data_ptr(),
+            num_layers_,
+            8,
+            max_seq_len_,
+            128,
+            start,
+            end,
+            stream
+        );
+        split_kv_fp8_ready_len_ = end;
+    }
 
     void launch_decode_step_backend(const int* in_ptr, int* out_ptr, const int* p_ptr, cudaStream_t stream) {
         if (decode_backend_ != 0) {
@@ -1297,6 +1408,11 @@ public:
                 sin_table_.data_ptr(),
                 k_cache_.data_ptr(),
                 v_cache_.data_ptr(),
+                split_k_cache_fp8_.defined() ? split_k_cache_fp8_.data_ptr() : nullptr,
+                split_v_cache_fp8_.defined() ? split_v_cache_fp8_.data_ptr() : nullptr,
+                split_k_scale_cache_.defined() ? split_k_scale_cache_.data_ptr() : nullptr,
+                split_v_scale_cache_.defined() ? split_v_scale_cache_.data_ptr() : nullptr,
+                split_kv_fp8_enabled_ ? 1 : 0,
                 split_attn_partial_m_.defined() ? split_attn_partial_m_.data_ptr() : nullptr,
                 split_attn_partial_s_.defined() ? split_attn_partial_s_.data_ptr() : nullptr,
                 split_attn_partial_out_.defined() ? split_attn_partial_out_.data_ptr() : nullptr,
@@ -1482,6 +1598,12 @@ private:
     int split_kv_block_size_{16};
     int split_kv_num_blocks_{0};
     torch::Tensor split_kv_block_table_;
+    bool split_kv_fp8_enabled_{false};
+    int split_kv_fp8_ready_len_{0};
+    torch::Tensor split_k_cache_fp8_;
+    torch::Tensor split_v_cache_fp8_;
+    torch::Tensor split_k_scale_cache_;
+    torch::Tensor split_v_scale_cache_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
