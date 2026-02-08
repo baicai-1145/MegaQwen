@@ -217,6 +217,36 @@ static inline bool _split_ffn_w4_enabled() {
     return mode == 1;
 }
 
+static inline bool _split_qkv_w4_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_QKV_W4");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
+static inline bool _split_o_w4_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_O_W4");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
 static inline int _split_attn_impl() {
     // 0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase)
     static int mode = -1;
@@ -425,6 +455,8 @@ struct SplitDebugAgg {
     long long down_gemv;
     long long down_fused_tail;
     long long down_fused_silu;
+    long long qkv_w4;
+    long long o_w4;
     long long gateup_w4;
     long long down_w4;
 };
@@ -482,8 +514,14 @@ extern "C" void split_debug_stage_print_summary() {
     printf("         gemv=%5lld\n", agg.down_gemv);
     printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld\n",
            _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu);
-    printf("         w4_enabled=%d gateup_w4=%5lld down_w4=%5lld\n",
-           _split_ffn_w4_enabled() ? 1 : 0, agg.gateup_w4, agg.down_w4);
+    printf("         qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d gateup_w4=%5lld down_w4=%5lld\n",
+           _split_qkv_w4_enabled() ? 1 : 0,
+           agg.qkv_w4,
+           _split_o_w4_enabled() ? 1 : 0,
+           agg.o_w4,
+           _split_ffn_w4_enabled() ? 1 : 0,
+           agg.gateup_w4,
+           agg.down_w4);
 
     int layer_n = (int)agg.max_layer_seen;
     if (layer_n > SPLIT_DEBUG_MAX_LAYERS) layer_n = SPLIT_DEBUG_MAX_LAYERS;

@@ -7,6 +7,18 @@ extern "C" void launch_split_decode_gemm(
     const void* const* qkv_weight_packed_ptrs,     // host [num_layers], each [Q+KV+KV, H]
     const void* const* gateup_weight_packed_ptrs,  // host [num_layers], each [2*I, H]
     const void* const* down_weight_ptrs,           // host [num_layers], each [H, I]
+    const void* const* q_w4_packed_ptrs,
+    const void* const* q_w4_scales_ptrs,
+    const void* const* q_w4_codebook_ptrs,
+    const void* const* k_w4_packed_ptrs,
+    const void* const* k_w4_scales_ptrs,
+    const void* const* k_w4_codebook_ptrs,
+    const void* const* v_w4_packed_ptrs,
+    const void* const* v_w4_scales_ptrs,
+    const void* const* v_w4_codebook_ptrs,
+    const void* const* o_w4_packed_ptrs,
+    const void* const* o_w4_scales_ptrs,
+    const void* const* o_w4_codebook_ptrs,
     const void* const* gateup_w4_packed_ptrs,      // host [num_layers], each uint8 packed [2*I*H/2]
     const void* const* gateup_w4_scales_ptrs,      // host [num_layers], float [2*I*H/64]
     const void* const* gateup_w4_codebook_ptrs,    // host [num_layers], float [16]
@@ -123,12 +135,30 @@ extern "C" void launch_split_decode_gemm(
         const __nv_bfloat16* qkv_weight = (const __nv_bfloat16*)qkv_weight_packed_ptrs[layer];
         const __nv_bfloat16* gateup_weight = (const __nv_bfloat16*)gateup_weight_packed_ptrs[layer];
         const __nv_bfloat16* down_weight = (const __nv_bfloat16*)down_weight_ptrs[layer];
+        const uint8_t* q_w4_packed = q_w4_packed_ptrs ? (const uint8_t*)q_w4_packed_ptrs[layer] : nullptr;
+        const float* q_w4_scales = q_w4_scales_ptrs ? (const float*)q_w4_scales_ptrs[layer] : nullptr;
+        const float* q_w4_codebook = q_w4_codebook_ptrs ? (const float*)q_w4_codebook_ptrs[layer] : nullptr;
+        const uint8_t* k_w4_packed = k_w4_packed_ptrs ? (const uint8_t*)k_w4_packed_ptrs[layer] : nullptr;
+        const float* k_w4_scales = k_w4_scales_ptrs ? (const float*)k_w4_scales_ptrs[layer] : nullptr;
+        const float* k_w4_codebook = k_w4_codebook_ptrs ? (const float*)k_w4_codebook_ptrs[layer] : nullptr;
+        const uint8_t* v_w4_packed = v_w4_packed_ptrs ? (const uint8_t*)v_w4_packed_ptrs[layer] : nullptr;
+        const float* v_w4_scales = v_w4_scales_ptrs ? (const float*)v_w4_scales_ptrs[layer] : nullptr;
+        const float* v_w4_codebook = v_w4_codebook_ptrs ? (const float*)v_w4_codebook_ptrs[layer] : nullptr;
+        const uint8_t* o_w4_packed = o_w4_packed_ptrs ? (const uint8_t*)o_w4_packed_ptrs[layer] : nullptr;
+        const float* o_w4_scales = o_w4_scales_ptrs ? (const float*)o_w4_scales_ptrs[layer] : nullptr;
+        const float* o_w4_codebook = o_w4_codebook_ptrs ? (const float*)o_w4_codebook_ptrs[layer] : nullptr;
         const uint8_t* gateup_w4_packed = gateup_w4_packed_ptrs ? (const uint8_t*)gateup_w4_packed_ptrs[layer] : nullptr;
         const float* gateup_w4_scales = gateup_w4_scales_ptrs ? (const float*)gateup_w4_scales_ptrs[layer] : nullptr;
         const float* gateup_w4_codebook = gateup_w4_codebook_ptrs ? (const float*)gateup_w4_codebook_ptrs[layer] : nullptr;
         const uint8_t* down_w4_packed = down_w4_packed_ptrs ? (const uint8_t*)down_w4_packed_ptrs[layer] : nullptr;
         const float* down_w4_scales = down_w4_scales_ptrs ? (const float*)down_w4_scales_ptrs[layer] : nullptr;
         const float* down_w4_codebook = down_w4_codebook_ptrs ? (const float*)down_w4_codebook_ptrs[layer] : nullptr;
+        bool qkv_w4 = _split_qkv_w4_enabled() &&
+                      q_w4_packed != nullptr && q_w4_scales != nullptr && q_w4_codebook != nullptr &&
+                      k_w4_packed != nullptr && k_w4_scales != nullptr && k_w4_codebook != nullptr &&
+                      v_w4_packed != nullptr && v_w4_scales != nullptr && v_w4_codebook != nullptr;
+        bool o_w4 = _split_o_w4_enabled() &&
+                    o_w4_packed != nullptr && o_w4_scales != nullptr && o_w4_codebook != nullptr;
         bool ffn_w4 = _split_ffn_w4_enabled() &&
                       gateup_w4_packed != nullptr && gateup_w4_scales != nullptr && gateup_w4_codebook != nullptr &&
                       down_w4_packed != nullptr && down_w4_scales != nullptr && down_w4_codebook != nullptr;
@@ -154,7 +184,27 @@ extern "C" void launch_split_decode_gemm(
         bool qkv_gemv_done = false;
         bool qkv_use_gemv = _split_qkv_use_gemv();
         bool qkv_try_lt = _split_qkv_try_cublaslt();
-        if (!qkv_use_gemv && qkv_try_lt) {
+        if (qkv_w4) {
+            split_w4_qkv_matvec_bf16_out_kernel<<<QKV_ROWS, 256, 0, stream>>>(
+                q_w4_packed,
+                q_w4_scales,
+                q_w4_codebook,
+                k_w4_packed,
+                k_w4_scales,
+                k_w4_codebook,
+                v_w4_packed,
+                v_w4_scales,
+                v_w4_codebook,
+                (const __nv_bfloat16*)normalized_bf16,
+                (__nv_bfloat16*)qkv_proj_bf16,
+                HIDDEN_SIZE
+            );
+            qkv_done = true;
+            if (debug_stage_avg) {
+                auto& agg = _split_debug_agg();
+                agg.qkv_w4 += 1;
+            }
+        } else if (!qkv_use_gemv && qkv_try_lt) {
             qkv_done = _split_lt_matmul(
                 cublaslt_handle,
                 qkv_lt_plan,
@@ -197,7 +247,7 @@ extern "C" void launch_split_decode_gemm(
                 ), "qkv_gemm")) return;
             }
         }
-        if (debug_stage_avg) {
+        if (debug_stage_avg && !qkv_w4) {
             auto& agg = _split_debug_agg();
             if (!qkv_use_gemv && qkv_try_lt) {
                 if (qkv_lt_done) agg.qkv_lt_ok += 1;
@@ -312,7 +362,22 @@ extern "C" void launch_split_decode_gemm(
         bool o_gemv_done = false;
         bool o_use_gemv = _split_o_use_gemv();
         bool o_try_lt = _split_o_try_cublaslt();
-        if (!o_use_gemv && o_try_lt) {
+        if (o_w4) {
+            split_w4_matvec_bf16_out_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
+                o_w4_packed,
+                o_w4_scales,
+                o_w4_codebook,
+                (const __nv_bfloat16*)attn_out_bf16,
+                (__nv_bfloat16*)o_proj_out_bf16,
+                HIDDEN_SIZE,
+                Q_SIZE
+            );
+            o_done = true;
+            if (debug_stage_avg) {
+                auto& agg = _split_debug_agg();
+                agg.o_w4 += 1;
+            }
+        } else if (!o_use_gemv && o_try_lt) {
             o_done = _split_lt_matmul(
                 cublaslt_handle,
                 o_lt_plan,
@@ -355,7 +420,7 @@ extern "C" void launch_split_decode_gemm(
                 ), "o_gemm")) return;
             }
         }
-        if (debug_stage_avg) {
+        if (debug_stage_avg && !o_w4) {
             auto& agg = _split_debug_agg();
             if (!o_use_gemv && o_try_lt) {
                 if (o_lt_done) agg.o_lt_ok += 1;
@@ -452,7 +517,7 @@ extern "C" void launch_split_decode_gemm(
                 ), "gateup_gemm")) return;
             }
         }
-        if (debug_stage_avg) {
+        if (debug_stage_avg && !ffn_w4) {
             auto& agg = _split_debug_agg();
             if (!gateup_use_gemv && gateup_try_lt) {
                 if (gateup_lt_done) agg.gateup_lt_ok += 1;

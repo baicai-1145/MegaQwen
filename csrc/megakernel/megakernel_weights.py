@@ -262,7 +262,22 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
             for key in linear_weight_keys
             if key in tensors and tensors[key].dtype == torch.uint8
         ]
-        runtime_w4_enabled = str(os.environ.get("MEGAQWEN_SPLIT_FFN_W4", "")).lower() not in ("", "0", "false")
+        runtime_ffn_w4_enabled = str(os.environ.get("MEGAQWEN_SPLIT_FFN_W4", "")).lower() not in ("", "0", "false")
+        runtime_qkv_w4_enabled = str(os.environ.get("MEGAQWEN_SPLIT_QKV_W4", "")).lower() not in ("", "0", "false")
+        runtime_o_w4_enabled = str(os.environ.get("MEGAQWEN_SPLIT_O_W4", "")).lower() not in ("", "0", "false")
+        runtime_w4_enabled = runtime_ffn_w4_enabled or runtime_qkv_w4_enabled or runtime_o_w4_enabled
+        split_q_w4_packed: list[torch.Tensor] = []
+        split_q_w4_scales: list[torch.Tensor] = []
+        split_q_w4_codebook: list[torch.Tensor] = []
+        split_k_w4_packed: list[torch.Tensor] = []
+        split_k_w4_scales: list[torch.Tensor] = []
+        split_k_w4_codebook: list[torch.Tensor] = []
+        split_v_w4_packed: list[torch.Tensor] = []
+        split_v_w4_scales: list[torch.Tensor] = []
+        split_v_w4_codebook: list[torch.Tensor] = []
+        split_o_w4_packed: list[torch.Tensor] = []
+        split_o_w4_scales: list[torch.Tensor] = []
+        split_o_w4_codebook: list[torch.Tensor] = []
         split_gateup_w4_packed: list[torch.Tensor] = []
         split_gateup_w4_scales: list[torch.Tensor] = []
         split_gateup_w4_codebook: list[torch.Tensor] = []
@@ -285,31 +300,85 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
                 try:
                     for i in range(NUM_LAYERS):
                         p = f"{text_prefix}layers.{i}."
+                        q_key = p + "self_attn.q_proj.weight"
+                        k_key = p + "self_attn.k_proj.weight"
+                        v_key = p + "self_attn.v_proj.weight"
+                        o_key = p + "self_attn.o_proj.weight"
                         gate_key = p + "mlp.gate_proj.weight"
                         up_key = p + "mlp.up_proj.weight"
                         down_key = p + "mlp.down_proj.weight"
-                        if not (
-                            gate_key in tensors and up_key in tensors and down_key in tensors and
-                            tensors[gate_key].dtype == torch.uint8 and
-                            tensors[up_key].dtype == torch.uint8 and
-                            tensors[down_key].dtype == torch.uint8
-                        ):
-                            raise RuntimeError(f"Layer {i} missing W4 packed FFN tensors")
 
-                        gate_scales, gate_code = _bnb4_block_scales_and_codebook(gate_key, tensors)
-                        up_scales, up_code = _bnb4_block_scales_and_codebook(up_key, tensors)
-                        down_scales, down_code = _bnb4_block_scales_and_codebook(down_key, tensors)
+                        if runtime_qkv_w4_enabled:
+                            if not (
+                                q_key in tensors and k_key in tensors and v_key in tensors and
+                                tensors[q_key].dtype == torch.uint8 and
+                                tensors[k_key].dtype == torch.uint8 and
+                                tensors[v_key].dtype == torch.uint8
+                            ):
+                                raise RuntimeError(f"Layer {i} missing W4 packed QKV tensors")
+                            q_scales, q_code = _bnb4_block_scales_and_codebook(q_key, tensors)
+                            k_scales, k_code = _bnb4_block_scales_and_codebook(k_key, tensors)
+                            v_scales, v_code = _bnb4_block_scales_and_codebook(v_key, tensors)
+                            split_q_w4_packed.append(tensors[q_key].view(-1).contiguous())
+                            split_q_w4_scales.append(q_scales.contiguous())
+                            split_q_w4_codebook.append(q_code.contiguous())
+                            split_k_w4_packed.append(tensors[k_key].view(-1).contiguous())
+                            split_k_w4_scales.append(k_scales.contiguous())
+                            split_k_w4_codebook.append(k_code.contiguous())
+                            split_v_w4_packed.append(tensors[v_key].view(-1).contiguous())
+                            split_v_w4_scales.append(v_scales.contiguous())
+                            split_v_w4_codebook.append(v_code.contiguous())
 
-                        split_gateup_w4_packed.append(
-                            torch.cat([tensors[gate_key].view(-1), tensors[up_key].view(-1)], dim=0).contiguous()
-                        )
-                        split_gateup_w4_scales.append(torch.cat([gate_scales, up_scales], dim=0).contiguous())
-                        split_gateup_w4_codebook.append(torch.cat([gate_code, up_code], dim=0).contiguous())
-                        split_down_w4_packed.append(tensors[down_key].view(-1).contiguous())
-                        split_down_w4_scales.append(down_scales.contiguous())
-                        split_down_w4_codebook.append(down_code.contiguous())
-                    print("[MEGAQWEN_W4] runtime FFN W4 tensors prepared for split decode")
+                        if runtime_o_w4_enabled:
+                            if not (o_key in tensors and tensors[o_key].dtype == torch.uint8):
+                                raise RuntimeError(f"Layer {i} missing W4 packed O tensor")
+                            o_scales, o_code = _bnb4_block_scales_and_codebook(o_key, tensors)
+                            split_o_w4_packed.append(tensors[o_key].view(-1).contiguous())
+                            split_o_w4_scales.append(o_scales.contiguous())
+                            split_o_w4_codebook.append(o_code.contiguous())
+
+                        if runtime_ffn_w4_enabled:
+                            if not (
+                                gate_key in tensors and up_key in tensors and down_key in tensors and
+                                tensors[gate_key].dtype == torch.uint8 and
+                                tensors[up_key].dtype == torch.uint8 and
+                                tensors[down_key].dtype == torch.uint8
+                            ):
+                                raise RuntimeError(f"Layer {i} missing W4 packed FFN tensors")
+                            gate_scales, gate_code = _bnb4_block_scales_and_codebook(gate_key, tensors)
+                            up_scales, up_code = _bnb4_block_scales_and_codebook(up_key, tensors)
+                            down_scales, down_code = _bnb4_block_scales_and_codebook(down_key, tensors)
+                            split_gateup_w4_packed.append(
+                                torch.cat([tensors[gate_key].view(-1), tensors[up_key].view(-1)], dim=0).contiguous()
+                            )
+                            split_gateup_w4_scales.append(torch.cat([gate_scales, up_scales], dim=0).contiguous())
+                            split_gateup_w4_codebook.append(torch.cat([gate_code, up_code], dim=0).contiguous())
+                            split_down_w4_packed.append(tensors[down_key].view(-1).contiguous())
+                            split_down_w4_scales.append(down_scales.contiguous())
+                            split_down_w4_codebook.append(down_code.contiguous())
+
+                    msg_parts: list[str] = []
+                    if runtime_qkv_w4_enabled:
+                        msg_parts.append("QKV")
+                    if runtime_o_w4_enabled:
+                        msg_parts.append("O")
+                    if runtime_ffn_w4_enabled:
+                        msg_parts.append("FFN")
+                    msg = "+".join(msg_parts) if msg_parts else "none"
+                    print(f"[MEGAQWEN_W4] runtime {msg} W4 tensors prepared for split decode")
                 except Exception as exc:
+                    split_q_w4_packed = []
+                    split_q_w4_scales = []
+                    split_q_w4_codebook = []
+                    split_k_w4_packed = []
+                    split_k_w4_scales = []
+                    split_k_w4_codebook = []
+                    split_v_w4_packed = []
+                    split_v_w4_scales = []
+                    split_v_w4_codebook = []
+                    split_o_w4_packed = []
+                    split_o_w4_scales = []
+                    split_o_w4_codebook = []
                     split_gateup_w4_packed = []
                     split_gateup_w4_scales = []
                     split_gateup_w4_codebook = []
@@ -340,6 +409,18 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
             "cos_table": cos_table,
             "sin_table": sin_table,
             "tokenizer": tokenizer,
+            "split_q_w4_packed": split_q_w4_packed,
+            "split_q_w4_scales": split_q_w4_scales,
+            "split_q_w4_codebook": split_q_w4_codebook,
+            "split_k_w4_packed": split_k_w4_packed,
+            "split_k_w4_scales": split_k_w4_scales,
+            "split_k_w4_codebook": split_k_w4_codebook,
+            "split_v_w4_packed": split_v_w4_packed,
+            "split_v_w4_scales": split_v_w4_scales,
+            "split_v_w4_codebook": split_v_w4_codebook,
+            "split_o_w4_packed": split_o_w4_packed,
+            "split_o_w4_scales": split_o_w4_scales,
+            "split_o_w4_codebook": split_o_w4_codebook,
             "split_gateup_w4_packed": split_gateup_w4_packed,
             "split_gateup_w4_scales": split_gateup_w4_scales,
             "split_gateup_w4_codebook": split_gateup_w4_codebook,
@@ -369,6 +450,18 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
         "cos_table": cos_table,
         "sin_table": sin_table,
         "tokenizer": tokenizer,
+        "split_q_w4_packed": [],
+        "split_q_w4_scales": [],
+        "split_q_w4_codebook": [],
+        "split_k_w4_packed": [],
+        "split_k_w4_scales": [],
+        "split_k_w4_codebook": [],
+        "split_v_w4_packed": [],
+        "split_v_w4_scales": [],
+        "split_v_w4_codebook": [],
+        "split_o_w4_packed": [],
+        "split_o_w4_scales": [],
+        "split_o_w4_codebook": [],
         "split_gateup_w4_packed": [],
         "split_gateup_w4_scales": [],
         "split_gateup_w4_codebook": [],

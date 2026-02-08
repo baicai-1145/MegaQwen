@@ -168,6 +168,18 @@ extern "C" void launch_split_decode_gemm(
     const void* const* qkv_weight_packed_ptrs,
     const void* const* gateup_weight_packed_ptrs,
     const void* const* down_weight_ptrs,
+    const void* const* q_w4_packed_ptrs,
+    const void* const* q_w4_scales_ptrs,
+    const void* const* q_w4_codebook_ptrs,
+    const void* const* k_w4_packed_ptrs,
+    const void* const* k_w4_scales_ptrs,
+    const void* const* k_w4_codebook_ptrs,
+    const void* const* v_w4_packed_ptrs,
+    const void* const* v_w4_scales_ptrs,
+    const void* const* v_w4_codebook_ptrs,
+    const void* const* o_w4_packed_ptrs,
+    const void* const* o_w4_scales_ptrs,
+    const void* const* o_w4_codebook_ptrs,
     const void* const* gateup_w4_packed_ptrs,
     const void* const* gateup_w4_scales_ptrs,
     const void* const* gateup_w4_codebook_ptrs,
@@ -238,6 +250,18 @@ public:
         torch::Tensor lm_head_weight,
         torch::Tensor cos_table,
         torch::Tensor sin_table,
+        std::vector<torch::Tensor> split_q_w4_packed,
+        std::vector<torch::Tensor> split_q_w4_scales,
+        std::vector<torch::Tensor> split_q_w4_codebook,
+        std::vector<torch::Tensor> split_k_w4_packed,
+        std::vector<torch::Tensor> split_k_w4_scales,
+        std::vector<torch::Tensor> split_k_w4_codebook,
+        std::vector<torch::Tensor> split_v_w4_packed,
+        std::vector<torch::Tensor> split_v_w4_scales,
+        std::vector<torch::Tensor> split_v_w4_codebook,
+        std::vector<torch::Tensor> split_o_w4_packed,
+        std::vector<torch::Tensor> split_o_w4_scales,
+        std::vector<torch::Tensor> split_o_w4_codebook,
         std::vector<torch::Tensor> split_gateup_w4_packed,
         std::vector<torch::Tensor> split_gateup_w4_scales,
         std::vector<torch::Tensor> split_gateup_w4_codebook,
@@ -471,6 +495,59 @@ public:
                     split_qkv_weight_ptrs_.push_back(split_qkv_weight_tensors_.back().data_ptr());
                     split_gateup_weight_ptrs_.push_back(split_gateup_weight_tensors_.back().data_ptr());
                     split_down_weight_ptrs_.push_back(split_down_weight_tensors_.back().data_ptr());
+                }
+
+                if ((int)split_q_w4_packed.size() == num_layers_ &&
+                    (int)split_q_w4_scales.size() == num_layers_ &&
+                    (int)split_q_w4_codebook.size() == num_layers_ &&
+                    (int)split_k_w4_packed.size() == num_layers_ &&
+                    (int)split_k_w4_scales.size() == num_layers_ &&
+                    (int)split_k_w4_codebook.size() == num_layers_ &&
+                    (int)split_v_w4_packed.size() == num_layers_ &&
+                    (int)split_v_w4_scales.size() == num_layers_ &&
+                    (int)split_v_w4_codebook.size() == num_layers_ &&
+                    (int)split_o_w4_packed.size() == num_layers_ &&
+                    (int)split_o_w4_scales.size() == num_layers_ &&
+                    (int)split_o_w4_codebook.size() == num_layers_) {
+                    split_q_w4_packed_tensors_ = std::move(split_q_w4_packed);
+                    split_q_w4_scales_tensors_ = std::move(split_q_w4_scales);
+                    split_q_w4_codebook_tensors_ = std::move(split_q_w4_codebook);
+                    split_k_w4_packed_tensors_ = std::move(split_k_w4_packed);
+                    split_k_w4_scales_tensors_ = std::move(split_k_w4_scales);
+                    split_k_w4_codebook_tensors_ = std::move(split_k_w4_codebook);
+                    split_v_w4_packed_tensors_ = std::move(split_v_w4_packed);
+                    split_v_w4_scales_tensors_ = std::move(split_v_w4_scales);
+                    split_v_w4_codebook_tensors_ = std::move(split_v_w4_codebook);
+                    split_o_w4_packed_tensors_ = std::move(split_o_w4_packed);
+                    split_o_w4_scales_tensors_ = std::move(split_o_w4_scales);
+                    split_o_w4_codebook_tensors_ = std::move(split_o_w4_codebook);
+                    split_q_w4_packed_ptrs_.reserve(num_layers_);
+                    split_q_w4_scales_ptrs_.reserve(num_layers_);
+                    split_q_w4_codebook_ptrs_.reserve(num_layers_);
+                    split_k_w4_packed_ptrs_.reserve(num_layers_);
+                    split_k_w4_scales_ptrs_.reserve(num_layers_);
+                    split_k_w4_codebook_ptrs_.reserve(num_layers_);
+                    split_v_w4_packed_ptrs_.reserve(num_layers_);
+                    split_v_w4_scales_ptrs_.reserve(num_layers_);
+                    split_v_w4_codebook_ptrs_.reserve(num_layers_);
+                    split_o_w4_packed_ptrs_.reserve(num_layers_);
+                    split_o_w4_scales_ptrs_.reserve(num_layers_);
+                    split_o_w4_codebook_ptrs_.reserve(num_layers_);
+                    for (int i = 0; i < num_layers_; i++) {
+                        split_q_w4_packed_ptrs_.push_back(split_q_w4_packed_tensors_[i].data_ptr());
+                        split_q_w4_scales_ptrs_.push_back(split_q_w4_scales_tensors_[i].data_ptr());
+                        split_q_w4_codebook_ptrs_.push_back(split_q_w4_codebook_tensors_[i].data_ptr());
+                        split_k_w4_packed_ptrs_.push_back(split_k_w4_packed_tensors_[i].data_ptr());
+                        split_k_w4_scales_ptrs_.push_back(split_k_w4_scales_tensors_[i].data_ptr());
+                        split_k_w4_codebook_ptrs_.push_back(split_k_w4_codebook_tensors_[i].data_ptr());
+                        split_v_w4_packed_ptrs_.push_back(split_v_w4_packed_tensors_[i].data_ptr());
+                        split_v_w4_scales_ptrs_.push_back(split_v_w4_scales_tensors_[i].data_ptr());
+                        split_v_w4_codebook_ptrs_.push_back(split_v_w4_codebook_tensors_[i].data_ptr());
+                        split_o_w4_packed_ptrs_.push_back(split_o_w4_packed_tensors_[i].data_ptr());
+                        split_o_w4_scales_ptrs_.push_back(split_o_w4_scales_tensors_[i].data_ptr());
+                        split_o_w4_codebook_ptrs_.push_back(split_o_w4_codebook_tensors_[i].data_ptr());
+                    }
+                    std::printf("[MEGAQWEN_W4] split decode runtime QKV/O W4 enabled for %d layers\n", num_layers_);
                 }
 
                 if ((int)split_gateup_w4_packed.size() == num_layers_ &&
@@ -1153,6 +1230,18 @@ public:
                 split_qkv_weight_ptrs_.empty() ? nullptr : split_qkv_weight_ptrs_.data(),
                 split_gateup_weight_ptrs_.empty() ? nullptr : split_gateup_weight_ptrs_.data(),
                 split_down_weight_ptrs_.empty() ? nullptr : split_down_weight_ptrs_.data(),
+                split_q_w4_packed_ptrs_.empty() ? nullptr : split_q_w4_packed_ptrs_.data(),
+                split_q_w4_scales_ptrs_.empty() ? nullptr : split_q_w4_scales_ptrs_.data(),
+                split_q_w4_codebook_ptrs_.empty() ? nullptr : split_q_w4_codebook_ptrs_.data(),
+                split_k_w4_packed_ptrs_.empty() ? nullptr : split_k_w4_packed_ptrs_.data(),
+                split_k_w4_scales_ptrs_.empty() ? nullptr : split_k_w4_scales_ptrs_.data(),
+                split_k_w4_codebook_ptrs_.empty() ? nullptr : split_k_w4_codebook_ptrs_.data(),
+                split_v_w4_packed_ptrs_.empty() ? nullptr : split_v_w4_packed_ptrs_.data(),
+                split_v_w4_scales_ptrs_.empty() ? nullptr : split_v_w4_scales_ptrs_.data(),
+                split_v_w4_codebook_ptrs_.empty() ? nullptr : split_v_w4_codebook_ptrs_.data(),
+                split_o_w4_packed_ptrs_.empty() ? nullptr : split_o_w4_packed_ptrs_.data(),
+                split_o_w4_scales_ptrs_.empty() ? nullptr : split_o_w4_scales_ptrs_.data(),
+                split_o_w4_codebook_ptrs_.empty() ? nullptr : split_o_w4_codebook_ptrs_.data(),
                 split_gateup_w4_packed_ptrs_.empty() ? nullptr : split_gateup_w4_packed_ptrs_.data(),
                 split_gateup_w4_scales_ptrs_.empty() ? nullptr : split_gateup_w4_scales_ptrs_.data(),
                 split_gateup_w4_codebook_ptrs_.empty() ? nullptr : split_gateup_w4_codebook_ptrs_.data(),
@@ -1300,6 +1389,18 @@ private:
     std::vector<torch::Tensor> split_qkv_weight_tensors_;
     std::vector<torch::Tensor> split_gateup_weight_tensors_;
     std::vector<torch::Tensor> split_down_weight_tensors_;
+    std::vector<torch::Tensor> split_q_w4_packed_tensors_;
+    std::vector<torch::Tensor> split_q_w4_scales_tensors_;
+    std::vector<torch::Tensor> split_q_w4_codebook_tensors_;
+    std::vector<torch::Tensor> split_k_w4_packed_tensors_;
+    std::vector<torch::Tensor> split_k_w4_scales_tensors_;
+    std::vector<torch::Tensor> split_k_w4_codebook_tensors_;
+    std::vector<torch::Tensor> split_v_w4_packed_tensors_;
+    std::vector<torch::Tensor> split_v_w4_scales_tensors_;
+    std::vector<torch::Tensor> split_v_w4_codebook_tensors_;
+    std::vector<torch::Tensor> split_o_w4_packed_tensors_;
+    std::vector<torch::Tensor> split_o_w4_scales_tensors_;
+    std::vector<torch::Tensor> split_o_w4_codebook_tensors_;
     std::vector<torch::Tensor> split_gateup_w4_packed_tensors_;
     std::vector<torch::Tensor> split_gateup_w4_scales_tensors_;
     std::vector<torch::Tensor> split_gateup_w4_codebook_tensors_;
@@ -1309,6 +1410,18 @@ private:
     std::vector<const void*> split_qkv_weight_ptrs_;
     std::vector<const void*> split_gateup_weight_ptrs_;
     std::vector<const void*> split_down_weight_ptrs_;
+    std::vector<const void*> split_q_w4_packed_ptrs_;
+    std::vector<const void*> split_q_w4_scales_ptrs_;
+    std::vector<const void*> split_q_w4_codebook_ptrs_;
+    std::vector<const void*> split_k_w4_packed_ptrs_;
+    std::vector<const void*> split_k_w4_scales_ptrs_;
+    std::vector<const void*> split_k_w4_codebook_ptrs_;
+    std::vector<const void*> split_v_w4_packed_ptrs_;
+    std::vector<const void*> split_v_w4_scales_ptrs_;
+    std::vector<const void*> split_v_w4_codebook_ptrs_;
+    std::vector<const void*> split_o_w4_packed_ptrs_;
+    std::vector<const void*> split_o_w4_scales_ptrs_;
+    std::vector<const void*> split_o_w4_codebook_ptrs_;
     std::vector<const void*> split_gateup_w4_packed_ptrs_;
     std::vector<const void*> split_gateup_w4_scales_ptrs_;
     std::vector<const void*> split_gateup_w4_codebook_ptrs_;
@@ -1330,6 +1443,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       torch::Tensor, torch::Tensor, torch::Tensor,
                       std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
                       std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+                      std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+                      std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+                      std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+                      std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
                       int, int, int>(),
              py::arg("embed_weight"),
              py::arg("layer_weights_flat"),
@@ -1337,6 +1454,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("lm_head_weight"),
              py::arg("cos_table"),
              py::arg("sin_table"),
+             py::arg("split_q_w4_packed") = std::vector<torch::Tensor>{},
+             py::arg("split_q_w4_scales") = std::vector<torch::Tensor>{},
+             py::arg("split_q_w4_codebook") = std::vector<torch::Tensor>{},
+             py::arg("split_k_w4_packed") = std::vector<torch::Tensor>{},
+             py::arg("split_k_w4_scales") = std::vector<torch::Tensor>{},
+             py::arg("split_k_w4_codebook") = std::vector<torch::Tensor>{},
+             py::arg("split_v_w4_packed") = std::vector<torch::Tensor>{},
+             py::arg("split_v_w4_scales") = std::vector<torch::Tensor>{},
+             py::arg("split_v_w4_codebook") = std::vector<torch::Tensor>{},
+             py::arg("split_o_w4_packed") = std::vector<torch::Tensor>{},
+             py::arg("split_o_w4_scales") = std::vector<torch::Tensor>{},
+             py::arg("split_o_w4_codebook") = std::vector<torch::Tensor>{},
              py::arg("split_gateup_w4_packed") = std::vector<torch::Tensor>{},
              py::arg("split_gateup_w4_scales") = std::vector<torch::Tensor>{},
              py::arg("split_gateup_w4_codebook") = std::vector<torch::Tensor>{},

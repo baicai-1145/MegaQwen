@@ -824,6 +824,72 @@ __global__ void split_w4_matvec_bf16_out_kernel(
     }
 }
 
+__global__ void split_w4_qkv_matvec_bf16_out_kernel(
+    const uint8_t* __restrict__ q_packed_w4,
+    const float* __restrict__ q_scales,
+    const float* __restrict__ q_codebook,
+    const uint8_t* __restrict__ k_packed_w4,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ k_codebook,
+    const uint8_t* __restrict__ v_packed_w4,
+    const float* __restrict__ v_scales,
+    const float* __restrict__ v_codebook,
+    const __nv_bfloat16* __restrict__ x_bf16,
+    __nv_bfloat16* __restrict__ y_bf16,
+    int cols
+) {
+    int out_row = (int)blockIdx.x;
+    if (out_row >= (Q_SIZE + KV_SIZE + KV_SIZE)) return;
+
+    const uint8_t* packed_w4 = nullptr;
+    const float* scales = nullptr;
+    const float* codebook = nullptr;
+    int local_row = 0;
+    if (out_row < Q_SIZE) {
+        packed_w4 = q_packed_w4;
+        scales = q_scales;
+        codebook = q_codebook;
+        local_row = out_row;
+    } else if (out_row < (Q_SIZE + KV_SIZE)) {
+        packed_w4 = k_packed_w4;
+        scales = k_scales;
+        codebook = k_codebook;
+        local_row = out_row - Q_SIZE;
+    } else {
+        packed_w4 = v_packed_w4;
+        scales = v_scales;
+        codebook = v_codebook;
+        local_row = out_row - Q_SIZE - KV_SIZE;
+    }
+
+    constexpr int kBlock = 256;
+    constexpr int kWarps = kBlock / WARP_SIZE;
+    __shared__ float smem_reduce[kWarps];
+
+    float local_sum = 0.0f;
+    int64_t row_base = (int64_t)local_row * (int64_t)cols;
+    for (int col = threadIdx.x; col < cols; col += kBlock) {
+        int64_t linear = row_base + (int64_t)col;
+        uint8_t pack = packed_w4[linear >> 1];
+        int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
+        float weight = codebook[q] * scales[linear >> 6];
+        float x_value = __bfloat162float(x_bf16[col]);
+        local_sum += weight * x_value;
+    }
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum);
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0) y_bf16[out_row] = __float2bfloat16(sum);
+    }
+}
+
 __global__ void split_w4_downproj_residual_kernel(
     const uint8_t* __restrict__ packed_w4,
     const float* __restrict__ scales,
