@@ -104,6 +104,7 @@ def main() -> None:
         "MEGAQWEN_SPLIT_QKV_W4=" + os.environ.get("MEGAQWEN_SPLIT_QKV_W4", ""),
         "MEGAQWEN_SPLIT_O_W4=" + os.environ.get("MEGAQWEN_SPLIT_O_W4", ""),
         "MEGAQWEN_SPLIT_FFN_W4=" + os.environ.get("MEGAQWEN_SPLIT_FFN_W4", ""),
+        "MEGAQWEN_SPLIT_FFN_W4_FUSED=" + os.environ.get("MEGAQWEN_SPLIT_FFN_W4_FUSED", ""),
         "MEGAQWEN_SPLIT_LTWK_MB=" + os.environ.get("MEGAQWEN_SPLIT_LTWK_MB", ""),
         "MEGAQWEN_SPLIT_ATTN_IMPL=" + os.environ.get("MEGAQWEN_SPLIT_ATTN_IMPL", ""),
         "MEGAQWEN_SPLIT_ATTN_WARPS=" + os.environ.get("MEGAQWEN_SPLIT_ATTN_WARPS", ""),

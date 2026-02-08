@@ -532,11 +532,12 @@ extern "C" void launch_split_decode_gemm(
         __nv_bfloat16* up_out_bf16 = gate_out_bf16 + INTERMEDIATE_SIZE;
 
         int ffn_impl = _split_ffn_impl();
-        bool ffn_fused_tail = (ffn_impl != SPLIT_FFN_CUBLAS);
+        bool ffn_w4_fused_silu_down = ffn_w4 && _split_ffn_w4_fused_silu_down_enabled();
+        bool ffn_fused_tail = (!ffn_w4) && (ffn_impl != SPLIT_FFN_CUBLAS);
 
         // 9) SiLU(gate) * up
         int dbg_silu = dbg_begin(SPLIT_STAGE_SILU_MUL, layer);
-        if (ffn_impl != SPLIT_FFN_FUSED_SILU_DOWN) {
+        if (ffn_impl != SPLIT_FFN_FUSED_SILU_DOWN && !ffn_w4_fused_silu_down) {
             prefill_silu_mul_kernel<<<(INTERMEDIATE_SIZE + 255) / 256, 256, 0, stream>>>(
                 (const __nv_bfloat16*)gate_out_bf16,
                 (const __nv_bfloat16*)up_out_bf16,
@@ -555,7 +556,23 @@ extern "C" void launch_split_decode_gemm(
         bool down_try_lt = false;
         bool down_use_gemv = false;
         bool down_w4_done = false;
-        if (ffn_impl == SPLIT_FFN_FUSED_SILU_DOWN) {
+        if (ffn_w4_fused_silu_down) {
+            split_w4_silu_downproj_residual_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
+                (const __nv_bfloat16*)gateup_out_bf16,
+                down_w4_packed,
+                down_w4_scales,
+                down_w4_codebook,
+                (const float*)residual_f32,
+                (float*)hidden_f32
+            );
+            down_done = true;
+            down_w4_done = true;
+            if (debug_stage_avg) {
+                auto& agg = _split_debug_agg();
+                agg.down_fused_silu_w4 += 1;
+                agg.down_w4 += 1;
+            }
+        } else if (ffn_impl == SPLIT_FFN_FUSED_SILU_DOWN) {
             split_silu_downproj_residual_fused_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
                 (const __nv_bfloat16*)gateup_out_bf16,
                 down_weight,

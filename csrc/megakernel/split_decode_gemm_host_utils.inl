@@ -217,6 +217,22 @@ static inline bool _split_ffn_w4_enabled() {
     return mode == 1;
 }
 
+static inline bool _split_ffn_w4_fused_silu_down_enabled() {
+    // default on: for W4 FFN, fuse silu+down+residual to reduce launch and DRAM traffic.
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_FFN_W4_FUSED");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "1") == 0 ||
+        std::strcmp(s, "true") == 0 ||
+        std::strcmp(s, "True") == 0) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+    return mode == 1;
+}
+
 static inline bool _split_qkv_w4_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
@@ -455,6 +471,7 @@ struct SplitDebugAgg {
     long long down_gemv;
     long long down_fused_tail;
     long long down_fused_silu;
+    long long down_fused_silu_w4;
     long long qkv_w4;
     long long o_w4;
     long long gateup_w4;
@@ -512,14 +529,15 @@ extern "C" void split_debug_stage_print_summary() {
     printf("  down   impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
            _split_down_impl_name(), agg.down_lt_ok, agg.down_lt_fb, agg.down_gemmex);
     printf("         gemv=%5lld\n", agg.down_gemv);
-    printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld\n",
-           _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu);
-    printf("         qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d gateup_w4=%5lld down_w4=%5lld\n",
+    printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
+           _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
+    printf("         qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
            _split_qkv_w4_enabled() ? 1 : 0,
            agg.qkv_w4,
            _split_o_w4_enabled() ? 1 : 0,
            agg.o_w4,
            _split_ffn_w4_enabled() ? 1 : 0,
+           _split_ffn_w4_fused_silu_down_enabled() ? 1 : 0,
            agg.gateup_w4,
            agg.down_w4);
 

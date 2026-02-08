@@ -929,6 +929,52 @@ __global__ void split_w4_downproj_residual_kernel(
     }
 }
 
+__global__ void split_w4_silu_downproj_residual_kernel(
+    const __nv_bfloat16* __restrict__ gateup_out_bf16,  // [2 * INTERMEDIATE_SIZE], [gate | up]
+    const uint8_t* __restrict__ down_packed_w4,         // [HIDDEN_SIZE * INTERMEDIATE_SIZE / 2]
+    const float* __restrict__ down_scales,              // [HIDDEN_SIZE * INTERMEDIATE_SIZE / 64]
+    const float* __restrict__ down_codebook,            // [16]
+    const float* __restrict__ residual_f32,             // [HIDDEN_SIZE]
+    float* __restrict__ hidden_f32                      // [HIDDEN_SIZE]
+) {
+    int out_idx = (int)blockIdx.x;
+    if (out_idx >= HIDDEN_SIZE) return;
+
+    constexpr int kBlock = 256;
+    constexpr int kWarps = kBlock / WARP_SIZE;
+    __shared__ float smem_reduce[kWarps];
+
+    const __nv_bfloat16* gate = gateup_out_bf16;
+    const __nv_bfloat16* up = gateup_out_bf16 + INTERMEDIATE_SIZE;
+
+    float local_sum = 0.0f;
+    int64_t row_base = (int64_t)out_idx * (int64_t)INTERMEDIATE_SIZE;
+    for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += kBlock) {
+        float gate_v = __bfloat162float(gate[i]);
+        float up_v = __bfloat162float(up[i]);
+        float silu_v = gate_v / (1.0f + expf(-gate_v));
+
+        int64_t linear = row_base + (int64_t)i;
+        uint8_t pack = down_packed_w4[linear >> 1];
+        int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
+        float down_w = down_codebook[q] * down_scales[linear >> 6];
+
+        local_sum += (silu_v * up_v) * down_w;
+    }
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum);
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0) hidden_f32[out_idx] = sum + residual_f32[out_idx];
+    }
+}
+
 // =============================================================================
 // Host entry: one split decode step (single token)
 // =============================================================================
