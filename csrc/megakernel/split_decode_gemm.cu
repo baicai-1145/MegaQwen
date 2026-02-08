@@ -779,6 +779,90 @@ __global__ void split_silu_downproj_residual_fused_kernel(
     }
 }
 
+// Runtime W4A16 matvec (NF4/FP4 compatible codebook+scales):
+// - packed_w4: 2 int4 values per byte, row-major over [rows, cols]
+// - scales: per-64-element block scale (linear indexing)
+// - codebook: 16-entry dequant table
+__global__ void split_w4_matvec_bf16_out_kernel(
+    const uint8_t* __restrict__ packed_w4,
+    const float* __restrict__ scales,
+    const float* __restrict__ codebook,
+    const __nv_bfloat16* __restrict__ x_bf16,
+    __nv_bfloat16* __restrict__ y_bf16,
+    int rows,
+    int cols
+) {
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+
+    constexpr int kBlock = 256;
+    constexpr int kWarps = kBlock / WARP_SIZE;
+    __shared__ float smem_reduce[kWarps];
+    int codebook_base = (rows == (INTERMEDIATE_SIZE + INTERMEDIATE_SIZE) && row >= INTERMEDIATE_SIZE) ? 16 : 0;
+
+    float local_sum = 0.0f;
+    int64_t row_base = (int64_t)row * (int64_t)cols;
+    for (int col = threadIdx.x; col < cols; col += kBlock) {
+        int64_t linear = row_base + (int64_t)col;
+        uint8_t pack = packed_w4[linear >> 1];
+        int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
+        float w = codebook[codebook_base + q] * scales[linear >> 6];
+        float xv = __bfloat162float(x_bf16[col]);
+        local_sum += w * xv;
+    }
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum);
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0) y_bf16[row] = __float2bfloat16(sum);
+    }
+}
+
+__global__ void split_w4_downproj_residual_kernel(
+    const uint8_t* __restrict__ packed_w4,
+    const float* __restrict__ scales,
+    const float* __restrict__ codebook,
+    const __nv_bfloat16* __restrict__ x_bf16,   // [INTERMEDIATE_SIZE]
+    const float* __restrict__ residual_f32,      // [HIDDEN_SIZE]
+    float* __restrict__ hidden_f32               // [HIDDEN_SIZE]
+) {
+    int row = (int)blockIdx.x;
+    if (row >= HIDDEN_SIZE) return;
+
+    constexpr int kBlock = 256;
+    constexpr int kWarps = kBlock / WARP_SIZE;
+    __shared__ float smem_reduce[kWarps];
+
+    float local_sum = 0.0f;
+    int64_t row_base = (int64_t)row * (int64_t)INTERMEDIATE_SIZE;
+    for (int col = threadIdx.x; col < INTERMEDIATE_SIZE; col += kBlock) {
+        int64_t linear = row_base + (int64_t)col;
+        uint8_t pack = packed_w4[linear >> 1];
+        int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
+        float w = codebook[q] * scales[linear >> 6];
+        float xv = __bfloat162float(x_bf16[col]);
+        local_sum += w * xv;
+    }
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum);
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0) hidden_f32[row] = sum + residual_f32[row];
+    }
+}
+
 // =============================================================================
 // Host entry: one split decode step (single token)
 // =============================================================================

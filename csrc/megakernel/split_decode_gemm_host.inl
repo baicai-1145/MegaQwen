@@ -7,6 +7,12 @@ extern "C" void launch_split_decode_gemm(
     const void* const* qkv_weight_packed_ptrs,     // host [num_layers], each [Q+KV+KV, H]
     const void* const* gateup_weight_packed_ptrs,  // host [num_layers], each [2*I, H]
     const void* const* down_weight_ptrs,           // host [num_layers], each [H, I]
+    const void* const* gateup_w4_packed_ptrs,      // host [num_layers], each uint8 packed [2*I*H/2]
+    const void* const* gateup_w4_scales_ptrs,      // host [num_layers], float [2*I*H/64]
+    const void* const* gateup_w4_codebook_ptrs,    // host [num_layers], float [16]
+    const void* const* down_w4_packed_ptrs,        // host [num_layers], each uint8 packed [H*I/2]
+    const void* const* down_w4_scales_ptrs,        // host [num_layers], float [H*I/64]
+    const void* const* down_w4_codebook_ptrs,      // host [num_layers], float [16]
     const void* final_norm_weight,
     const void* lm_head_weight,
     const void* cos_table,        // bf16 [max_seq, head_dim]
@@ -117,6 +123,15 @@ extern "C" void launch_split_decode_gemm(
         const __nv_bfloat16* qkv_weight = (const __nv_bfloat16*)qkv_weight_packed_ptrs[layer];
         const __nv_bfloat16* gateup_weight = (const __nv_bfloat16*)gateup_weight_packed_ptrs[layer];
         const __nv_bfloat16* down_weight = (const __nv_bfloat16*)down_weight_ptrs[layer];
+        const uint8_t* gateup_w4_packed = gateup_w4_packed_ptrs ? (const uint8_t*)gateup_w4_packed_ptrs[layer] : nullptr;
+        const float* gateup_w4_scales = gateup_w4_scales_ptrs ? (const float*)gateup_w4_scales_ptrs[layer] : nullptr;
+        const float* gateup_w4_codebook = gateup_w4_codebook_ptrs ? (const float*)gateup_w4_codebook_ptrs[layer] : nullptr;
+        const uint8_t* down_w4_packed = down_w4_packed_ptrs ? (const uint8_t*)down_w4_packed_ptrs[layer] : nullptr;
+        const float* down_w4_scales = down_w4_scales_ptrs ? (const float*)down_w4_scales_ptrs[layer] : nullptr;
+        const float* down_w4_codebook = down_w4_codebook_ptrs ? (const float*)down_w4_codebook_ptrs[layer] : nullptr;
+        bool ffn_w4 = _split_ffn_w4_enabled() &&
+                      gateup_w4_packed != nullptr && gateup_w4_scales != nullptr && gateup_w4_codebook != nullptr &&
+                      down_w4_packed != nullptr && down_w4_scales != nullptr && down_w4_codebook != nullptr;
 
         __nv_bfloat16* layer_k_cache = (__nv_bfloat16*)k_cache + layer * kv_cache_layer_stride;
         __nv_bfloat16* layer_v_cache = (__nv_bfloat16*)v_cache + layer * kv_cache_layer_stride;
@@ -379,7 +394,22 @@ extern "C" void launch_split_decode_gemm(
         bool gateup_gemv_done = false;
         bool gateup_use_gemv = _split_gateup_use_gemv();
         bool gateup_try_lt = _split_gateup_try_cublaslt();
-        if (!gateup_use_gemv && gateup_try_lt) {
+        if (ffn_w4) {
+            split_w4_matvec_bf16_out_kernel<<<GATEUP_ROWS, 256, 0, stream>>>(
+                gateup_w4_packed,
+                gateup_w4_scales,
+                gateup_w4_codebook,
+                (const __nv_bfloat16*)mlp_norm_bf16,
+                (__nv_bfloat16*)gateup_out_bf16,
+                GATEUP_ROWS,
+                HIDDEN_SIZE
+            );
+            gateup_done = true;
+            if (debug_stage_avg) {
+                auto& agg = _split_debug_agg();
+                agg.gateup_w4 += 1;
+            }
+        } else if (!gateup_use_gemv && gateup_try_lt) {
             gateup_done = _split_lt_matmul(
                 cublaslt_handle,
                 gateup_lt_plan,
@@ -459,6 +489,7 @@ extern "C" void launch_split_decode_gemm(
         bool down_gemv_done = false;
         bool down_try_lt = false;
         bool down_use_gemv = false;
+        bool down_w4_done = false;
         if (ffn_impl == SPLIT_FFN_FUSED_SILU_DOWN) {
             split_silu_downproj_residual_fused_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
                 (const __nv_bfloat16*)gateup_out_bf16,
@@ -484,9 +515,26 @@ extern "C" void launch_split_decode_gemm(
                 agg.down_fused_tail += 1;
             }
         } else {
-            down_try_lt = _split_down_try_cublaslt();
-            down_use_gemv = _split_down_use_gemv();
-            if (!down_use_gemv && down_try_lt) {
+            if (ffn_w4) {
+                split_w4_downproj_residual_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
+                    down_w4_packed,
+                    down_w4_scales,
+                    down_w4_codebook,
+                    (const __nv_bfloat16*)mlp_intermediate_bf16,
+                    (const float*)residual_f32,
+                    (float*)hidden_f32
+                );
+                down_done = true;
+                down_w4_done = true;
+                if (debug_stage_avg) {
+                    auto& agg = _split_debug_agg();
+                    agg.down_w4 += 1;
+                }
+            } else {
+                down_try_lt = _split_down_try_cublaslt();
+                down_use_gemv = _split_down_use_gemv();
+            }
+            if (!down_done && !down_use_gemv && down_try_lt) {
                 down_done = _split_lt_matmul(
                     cublaslt_handle,
                     down_lt_plan,
@@ -529,7 +577,7 @@ extern "C" void launch_split_decode_gemm(
                     ), "down_gemm")) return;
                 }
             }
-            if (debug_stage_avg) {
+            if (debug_stage_avg && !down_w4_done) {
                 auto& agg = _split_debug_agg();
                 if (!down_use_gemv && down_try_lt) {
                     if (down_lt_done) agg.down_lt_ok += 1;
@@ -543,7 +591,7 @@ extern "C" void launch_split_decode_gemm(
 
         // 11) Residual add -> hidden
         int dbg_resid2 = dbg_begin(SPLIT_STAGE_RESID2, layer);
-        if (!ffn_fused_tail) {
+        if (!ffn_fused_tail && !down_w4_done) {
             split_residual_add_bf16_to_f32_kernel<<<(HIDDEN_SIZE + 255) / 256, 256, 0, stream>>>(
                 (const __nv_bfloat16*)down_out_bf16,
                 (const float*)residual_f32,

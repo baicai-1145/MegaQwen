@@ -6,6 +6,7 @@ from pathlib import Path
 import os
 
 import torch
+from safetensors.torch import safe_open
 from transformers import AutoFeatureExtractor, AutoTokenizer
 
 from .qwen3_asr import (
@@ -22,6 +23,106 @@ from .asr_result import ASRResult
 
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _available_tensor_keys(model_dir: Path) -> set[str]:
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = data.get("weight_map", {})
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"Invalid safetensors index: {index_path}")
+        return {str(key) for key in weight_map.keys()}
+    ckpt = model_dir / "model.safetensors"
+    if not ckpt.exists():
+        raise FileNotFoundError(f"Missing checkpoint: {ckpt}")
+    with safe_open(str(ckpt), framework="pt", device="cpu") as f:
+        return set(f.keys())
+
+
+def _collect_bnb4_meta_keys(weight_key: str, available_keys: set[str]) -> list[str]:
+    keys: list[str] = []
+    for suffix in [".absmax", ".quant_map", ".nested_absmax", ".nested_quant_map"]:
+        full = weight_key + suffix
+        if full in available_keys:
+            keys.append(full)
+    nf4 = weight_key + ".quant_state.bitsandbytes__nf4"
+    fp4 = weight_key + ".quant_state.bitsandbytes__fp4"
+    if nf4 in available_keys:
+        keys.append(nf4)
+    elif fp4 in available_keys:
+        keys.append(fp4)
+    return keys
+
+
+def _dequantize_bnb4_weight(
+    weight_key: str,
+    packed_weight: torch.Tensor,
+    tensors: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    try:
+        from bitsandbytes import functional as bnbf
+    except Exception as exc:
+        raise RuntimeError(
+            f"Detected bitsandbytes 4bit tensor for {weight_key}, but bitsandbytes is unavailable."
+        ) from exc
+
+    if packed_weight.dtype != torch.uint8:
+        return packed_weight
+
+    qkey_nf4 = weight_key + ".quant_state.bitsandbytes__nf4"
+    qkey_fp4 = weight_key + ".quant_state.bitsandbytes__fp4"
+    qkey = qkey_nf4 if qkey_nf4 in tensors else qkey_fp4
+    if qkey not in tensors:
+        raise RuntimeError(f"Missing quant_state tensor for {weight_key}")
+
+    qdict: dict[str, torch.Tensor] = {qkey: tensors[qkey]}
+    for suffix in [".absmax", ".quant_map", ".nested_absmax", ".nested_quant_map"]:
+        full = weight_key + suffix
+        if full in tensors:
+            qdict[full] = tensors[full]
+
+    try:
+        quant_state = bnbf.QuantState.from_dict(qdict, device=packed_weight.device)
+        dequant = bnbf.dequantize_4bit(packed_weight, quant_state=quant_state)
+    except Exception:
+        if packed_weight.device.type == "cuda" or not torch.cuda.is_available():
+            raise
+        moved = {k: v.to("cuda") for k, v in qdict.items()}
+        quant_state = bnbf.QuantState.from_dict(moved, device=torch.device("cuda"))
+        dequant = bnbf.dequantize_4bit(packed_weight.to("cuda"), quant_state=quant_state).to("cpu")
+
+    return dequant.contiguous()
+
+
+_ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
+    # Prefill attention: use flash_ext path by default (with experimental gate),
+    # and keep tail legacy layers for quality stability.
+    "MEGAQWEN_PREFILL_ATTN_IMPL": "flash_ext",
+    "MEGAQWEN_PREFILL_ATTN_EXPERIMENTAL": "1",
+    "MEGAQWEN_PREFILL_FLASH_EXT_TAIL_LEGACY_LAYERS": "2",
+    # Decode: use split_gemm + GPU-side greedy loop.
+    "MEGAQWEN_DECODE_BACKEND": "split_gemm",
+    "MEGAQWEN_DECODE_GPU_LOOP": "1",
+    "MEGAQWEN_SPLIT_ATTN_IMPL": "splitk2",
+    "MEGAQWEN_SPLIT_ATTN_WARPS": "8",
+    "MEGAQWEN_SPLIT_ATTN_CHUNK": "128",
+    "MEGAQWEN_SPLIT_QKV_GEMM_IMPL": "gemmex",
+    # Keep prefill stage logs on by default for profiling reproducibility.
+    "MEGAQWEN_DEBUG_PREFILL_STAGE": "1",
+    "MEGAQWEN_DEBUG_PREFILL_STAGE_SKIP": "1",
+    # Keep decode split-stage logs on by default (one-shot, skip warmup).
+    "MEGAQWEN_DEBUG_SPLIT_STAGE": "1",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE_SKIP": "1",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG": "1",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG_STRIDE": "16",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG_EXACT": "0",
+}
+
+
+def _apply_asr_megakernel_default_knobs() -> None:
+    for key, value in _ASR_MEGAKERNEL_DEFAULT_KNOBS.items():
+        os.environ.setdefault(key, value)
 
 
 def _maybe_print_ldg_stage_debug(cycles_cuda: torch.Tensor, *, kernel_ms: float | None = None) -> None:
@@ -144,6 +245,8 @@ class Qwen3ASRMegakernelModel:
         dtype: torch.dtype,
         opts: Qwen3ASRMegakernelOptions,
     ):
+        _apply_asr_megakernel_default_knobs()
+
         self.model_dir = Path(model_dir)
         self.device = device
         self.dtype = dtype
@@ -232,9 +335,23 @@ class Qwen3ASRMegakernelModel:
 
     def _load_audio_weights(self) -> None:
         audio_prefix = "thinker.audio_tower."
-        audio_keys = [audio_prefix + k for k in self.audio_tower.state_dict().keys()]
+        expected_local_keys = list(self.audio_tower.state_dict().keys())
+        audio_keys = [audio_prefix + k for k in expected_local_keys]
         tensors = load_tensors(self.model_dir, audio_keys, device="cpu")
-        audio_sd = {k[len(audio_prefix):]: v for k, v in tensors.items()}
+
+        quantized_audio_keys = [k for k in audio_keys if k in tensors and tensors[k].dtype == torch.uint8]
+        if quantized_audio_keys:
+            available = _available_tensor_keys(self.model_dir)
+            meta_keys: list[str] = []
+            for key in quantized_audio_keys:
+                meta_keys.extend(_collect_bnb4_meta_keys(key, available))
+            meta_keys = list(dict.fromkeys(meta_keys))
+            if meta_keys:
+                tensors.update(load_tensors(self.model_dir, meta_keys, device="cpu"))
+            for key in quantized_audio_keys:
+                tensors[key] = _dequantize_bnb4_weight(key, tensors[key], tensors)
+
+        audio_sd = {k: tensors[audio_prefix + k] for k in expected_local_keys}
         missing, unexpected = self.audio_tower.load_state_dict(audio_sd, strict=True)
         if missing or unexpected:
             raise RuntimeError(f"Audio tower state mismatch: missing={missing}, unexpected={unexpected}")
@@ -255,6 +372,12 @@ class Qwen3ASRMegakernelModel:
             weights["lm_head_weight"],
             weights["cos_table"],
             weights["sin_table"],
+            weights.get("split_gateup_w4_packed", []),
+            weights.get("split_gateup_w4_scales", []),
+            weights.get("split_gateup_w4_codebook", []),
+            weights.get("split_down_w4_packed", []),
+            weights.get("split_down_w4_scales", []),
+            weights.get("split_down_w4_codebook", []),
             NUM_LAYERS,
             self.opts.max_seq_len,
             self.opts.max_prefill_len,
