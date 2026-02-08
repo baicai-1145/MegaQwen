@@ -298,6 +298,7 @@ __global__ void decode_attention_cache_splitk_kernel(
 
     int q_head = (int)blockIdx.x;
     if (q_head >= num_q_heads) return;
+    if (num_kv_heads <= 0) return;
 
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -556,6 +557,248 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
     }
 }
 
+struct SplitFlashDecodeDebugRec {
+    unsigned long long cycles;
+    int cache_len;
+    int active_warps;
+    int tokens_processed;
+    int block_switches;
+    int oob_skips;
+    int tiles_processed;
+};
+
+// Flash-decode v2 phase-1:
+// - One block handles one (q_head, chunk).
+// - Warps process contiguous token tiles inside the chunk to improve paged-KV locality.
+// - Output format is shared with splitk phase-2 reducer.
+__global__ void decode_attention_cache_flash_phase1_kernel(
+    const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    float* __restrict__ partial_m,                   // [max_chunks, num_q_heads]
+    float* __restrict__ partial_s,                   // [max_chunks, num_q_heads]
+    float* __restrict__ partial_out,                 // [max_chunks, num_q_heads, head_dim]
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    float attn_scale,
+    int warps_per_head,
+    int chunk_size,
+    int max_chunks,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size,
+    const int* __restrict__ position_ptr,
+    SplitFlashDecodeDebugRec* __restrict__ debug_out // optional [max_chunks, num_q_heads]
+) {
+    constexpr int kMaxWarps = 8;
+    constexpr int kElemsPerLane = HEAD_DIM / WARP_SIZE;
+    constexpr int kFlashTile = 8;
+    __shared__ float sm_m[kMaxWarps];
+    __shared__ float sm_s[kMaxWarps];
+    __shared__ float sm_scale[kMaxWarps];
+    __shared__ float sm_out[kMaxWarps * HEAD_DIM];
+    __shared__ float sm_global_m;
+    __shared__ float sm_global_s;
+    __shared__ int sm_active_warps;
+    __shared__ int sm_tokens;
+    __shared__ int sm_switches;
+    __shared__ int sm_oob;
+    __shared__ int sm_tiles;
+    __shared__ unsigned long long sm_clock_begin;
+
+    if (head_dim != HEAD_DIM) return;
+    if (chunk_size <= 0 || max_chunks <= 0) return;
+    if (num_q_heads <= 0 || num_kv_heads <= 0) return;
+
+    int q_head = (int)(blockIdx.x % num_q_heads);
+    int chunk_idx = (int)(blockIdx.x / num_q_heads);
+    if (chunk_idx >= max_chunks) return;
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+
+    int position = *position_ptr;
+    int cache_len = position + 1;
+    if (cache_len > max_seq_len) cache_len = max_seq_len;
+    int t_start = chunk_idx * chunk_size;
+    if (t_start >= cache_len) return;
+    int t_end = t_start + chunk_size;
+    if (t_end > cache_len) t_end = cache_len;
+
+    int active_warps = warps_per_head;
+    if (active_warps > kMaxWarps) active_warps = kMaxWarps;
+    int chunk_tokens = t_end - t_start;
+    if (active_warps > chunk_tokens) active_warps = chunk_tokens;
+    if (active_warps <= 0) active_warps = 1;
+    if (threadIdx.x == 0) {
+        sm_active_warps = active_warps;
+        if (debug_out != nullptr) {
+            sm_tokens = 0;
+            sm_switches = 0;
+            sm_oob = 0;
+            sm_tiles = 0;
+            sm_clock_begin = clock64();
+        }
+    }
+    __syncthreads();
+    active_warps = sm_active_warps;
+
+    int kv_ratio = num_q_heads / num_kv_heads;
+    if (kv_ratio <= 0) kv_ratio = 1;
+    int kv_head = q_head / kv_ratio;
+    if (kv_head >= num_kv_heads) kv_head = num_kv_heads - 1;
+
+    const __nv_bfloat16* q_vec = q + q_head * head_dim;
+    float q_local[kElemsPerLane];
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id + i * WARP_SIZE;
+        q_local[i] = __bfloat162float(q_vec[d]);
+    }
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    float out_local[kElemsPerLane] = {0.f, 0.f, 0.f, 0.f};
+
+    const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * head_dim;
+    const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
+    bool paged = (kv_block_table != nullptr && kv_block_size > 0);
+    bool use_blocking = (kv_block_size > 0);
+
+    if (warp_id < active_warps) {
+        int local_tokens = 0;
+        int local_switches = 0;
+        int local_oob = 0;
+        int local_tiles = 0;
+        int block_size = (use_blocking ? kv_block_size : max_seq_len);
+        if (block_size <= 0) block_size = max_seq_len;
+        if (block_size <= 0) block_size = 1;
+        int chunk_block_start = t_start / block_size;
+        int chunk_block_end = (t_end + block_size - 1) / block_size;  // exclusive
+        int chunk_blocks = chunk_block_end - chunk_block_start;
+        int blocks_per_warp = (chunk_blocks + active_warps - 1) / active_warps;
+        int warp_block_start = chunk_block_start + warp_id * blocks_per_warp;
+        int warp_block_end = warp_block_start + blocks_per_warp;
+        if (warp_block_start < chunk_block_start) warp_block_start = chunk_block_start;
+        if (warp_block_end > chunk_block_end) warp_block_end = chunk_block_end;
+
+        for (int logical_block = warp_block_start; logical_block < warp_block_end; logical_block++) {
+            int block_token_begin = logical_block * block_size;
+            int block_token_end = block_token_begin + block_size;
+            if (block_token_begin < t_start) block_token_begin = t_start;
+            if (block_token_end > t_end) block_token_end = t_end;
+            if (block_token_begin >= block_token_end) continue;
+
+            int physical_block = logical_block;
+            if (paged) {
+                physical_block = kv_block_table[logical_block];
+            }
+            int physical_block_base = physical_block * block_size;
+            local_switches += 1;
+
+            for (int tile_start = block_token_begin; tile_start < block_token_end; tile_start += kFlashTile) {
+                local_tiles += 1;
+                #pragma unroll
+                for (int ti = 0; ti < kFlashTile; ti++) {
+                    int t = tile_start + ti;
+                    if (t >= block_token_end) break;
+                    int in_block = t - logical_block * block_size;
+                    int physical_t = physical_block_base + in_block;
+                    if (physical_t >= max_seq_len) {
+                        local_oob += 1;
+                        continue;
+                    }
+                    local_tokens += 1;
+
+                    const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
+                    const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
+
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < kElemsPerLane; i++) {
+                        int d = lane_id + i * WARP_SIZE;
+                        dot += q_local[i] * __bfloat162float(k_vec[d]);
+                    }
+                    dot = warp_reduce_sum(dot) * attn_scale;
+                    float score = __shfl_sync(0xffffffff, dot, 0);
+
+                    float m_new = fmaxf(m, score);
+                    float old_scale = expf(m - m_new);
+                    float new_scale = expf(score - m_new);
+                    s = s * old_scale + new_scale;
+
+                    #pragma unroll
+                    for (int i = 0; i < kElemsPerLane; i++) {
+                        int d = lane_id + i * WARP_SIZE;
+                        float vv = __bfloat162float(v_vec[d]);
+                        out_local[i] = out_local[i] * old_scale + vv * new_scale;
+                    }
+                    m = m_new;
+                }
+            }
+        }
+        if (debug_out != nullptr && lane_id == 0) {
+            atomicAdd(&sm_tokens, local_tokens);
+            atomicAdd(&sm_switches, local_switches);
+            atomicAdd(&sm_oob, local_oob);
+            atomicAdd(&sm_tiles, local_tiles);
+        }
+    }
+
+    if (lane_id == 0) {
+        sm_m[warp_id] = (warp_id < active_warps) ? m : -INFINITY;
+        sm_s[warp_id] = (warp_id < active_warps) ? s : 0.0f;
+    }
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id + i * WARP_SIZE;
+        sm_out[warp_id * HEAD_DIM + d] = (warp_id < active_warps) ? out_local[i] : 0.0f;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float g_m = -INFINITY;
+        for (int w = 0; w < active_warps; w++) g_m = fmaxf(g_m, sm_m[w]);
+        float g_s = 0.0f;
+        for (int w = 0; w < active_warps; w++) {
+            float scale = (sm_s[w] > 0.0f) ? expf(sm_m[w] - g_m) : 0.0f;
+            sm_scale[w] = scale;
+            g_s += sm_s[w] * scale;
+        }
+        sm_global_m = g_m;
+        sm_global_s = g_s;
+    }
+    __syncthreads();
+
+    int idx = chunk_idx * num_q_heads + q_head;
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id + i * WARP_SIZE;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kMaxWarps; w++) {
+            if (w < active_warps) acc += sm_out[w * HEAD_DIM + d] * sm_scale[w];
+        }
+        partial_out[idx * HEAD_DIM + d] = acc;
+    }
+    if (threadIdx.x == 0) {
+        partial_m[idx] = sm_global_m;
+        partial_s[idx] = sm_global_s;
+        if (debug_out != nullptr) {
+            SplitFlashDecodeDebugRec rec{};
+            rec.cycles = clock64() - sm_clock_begin;
+            rec.cache_len = cache_len;
+            rec.active_warps = active_warps;
+            rec.tokens_processed = sm_tokens;
+            rec.block_switches = sm_switches;
+            rec.oob_skips = sm_oob;
+            rec.tiles_processed = sm_tiles;
+            debug_out[idx] = rec;
+        }
+    }
+}
+
 // Split-K v2 phase-2: reduce all chunk summaries of one q_head.
 __global__ void decode_attention_cache_splitk_phase2_kernel(
     const float* __restrict__ partial_m,      // [max_chunks, num_q_heads]
@@ -614,6 +857,209 @@ __global__ void decode_attention_cache_splitk_phase2_kernel(
             acc += partial_out[idx * HEAD_DIM + d] * scale;
         }
         out_vec[d] = __float2bfloat16(acc * inv_s);
+    }
+}
+
+// Flash-decode style kernel (single kernel online softmax):
+// - One block per q_head.
+// - Warps split cache by contiguous ranges (better locality for paged KV).
+// - Per-warp online softmax summary is reduced inside block.
+__global__ void decode_attention_cache_flash_decode_kernel(
+    const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
+    __nv_bfloat16* __restrict__ out,                 // [num_q_heads, head_dim]
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    float attn_scale,
+    int warps_per_head,
+    const int* __restrict__ kv_block_table,
+    int kv_block_size,
+    const int* __restrict__ position_ptr,            // device scalar
+    SplitFlashDecodeDebugRec* __restrict__ debug_out // optional [num_q_heads]
+) {
+    if (head_dim != HEAD_DIM) return;
+    if (num_q_heads <= 0 || num_kv_heads <= 0) return;
+
+    constexpr int kMaxWarps = 8;
+    constexpr int kElemsPerLane = HEAD_DIM / WARP_SIZE;  // 4 (128 / 32)
+    constexpr int kFlashTile = 8;  // contiguous token tile per warp
+    __shared__ float sm_m[kMaxWarps];
+    __shared__ float sm_s[kMaxWarps];
+    __shared__ float sm_scale[kMaxWarps];
+    __shared__ float sm_out[kMaxWarps * HEAD_DIM];
+    __shared__ float sm_global_s;
+    __shared__ int sm_active_warps;
+    __shared__ int sm_tokens;
+    __shared__ int sm_block_switches;
+    __shared__ int sm_oob_skips;
+    __shared__ int sm_tiles_processed;
+    __shared__ unsigned long long sm_clock_begin;
+
+    int q_head = (int)blockIdx.x;
+    if (q_head >= num_q_heads) return;
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    if (warp_id >= warps_per_head) return;
+
+    int kv_ratio = num_q_heads / num_kv_heads;
+    if (kv_ratio <= 0) kv_ratio = 1;
+    int kv_head = q_head / kv_ratio;
+    if (kv_head >= num_kv_heads) kv_head = num_kv_heads - 1;
+
+    int position = *position_ptr;
+    int cache_len = position + 1;
+    if (cache_len > max_seq_len) cache_len = max_seq_len;
+
+    int active_warps = warps_per_head;
+    if (active_warps > kMaxWarps) active_warps = kMaxWarps;
+    if (active_warps > cache_len && cache_len > 0) active_warps = cache_len;
+    if (active_warps <= 0) active_warps = 1;
+    if (threadIdx.x == 0) {
+        sm_active_warps = active_warps;
+        if (debug_out != nullptr) {
+            sm_tokens = 0;
+            sm_block_switches = 0;
+            sm_oob_skips = 0;
+            sm_tiles_processed = 0;
+            sm_clock_begin = clock64();
+        }
+    }
+    __syncthreads();
+    active_warps = sm_active_warps;
+    if (warp_id >= active_warps) return;
+
+    const __nv_bfloat16* q_vec = q + q_head * HEAD_DIM;
+    __nv_bfloat16* out_vec = out + q_head * HEAD_DIM;
+    float q_local[kElemsPerLane];
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id + i * WARP_SIZE;
+        q_local[i] = __bfloat162float(q_vec[d]);
+    }
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    float out_local[kElemsPerLane] = {0.f, 0.f, 0.f, 0.f};
+
+    const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * HEAD_DIM;
+    const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * HEAD_DIM;
+    bool paged = (kv_block_table != nullptr && kv_block_size > 0);
+
+    int cached_logical_block = -1;
+    int cached_physical_block = 0;
+    int local_tokens = 0;
+    int local_block_switches = 0;
+    int local_oob_skips = 0;
+    int local_tiles = 0;
+    for (int tile_start = warp_id * kFlashTile;
+         tile_start < cache_len;
+         tile_start += active_warps * kFlashTile) {
+        local_tiles += 1;
+        #pragma unroll
+        for (int ti = 0; ti < kFlashTile; ti++) {
+            int t = tile_start + ti;
+            if (t >= cache_len) break;
+
+            int physical_t = t;
+            if (paged) {
+                int logical_block = t / kv_block_size;
+                if (logical_block != cached_logical_block) {
+                    cached_logical_block = logical_block;
+                    cached_physical_block = kv_block_table[logical_block];
+                    local_block_switches += 1;
+                }
+                int in_block = t - logical_block * kv_block_size;
+                physical_t = cached_physical_block * kv_block_size + in_block;
+            }
+            if (physical_t >= max_seq_len) {
+                local_oob_skips += 1;
+                continue;
+            }
+            local_tokens += 1;
+
+            const __nv_bfloat16* k_vec = k_base + physical_t * HEAD_DIM;
+            const __nv_bfloat16* v_vec = v_base + physical_t * HEAD_DIM;
+
+            float dot = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < kElemsPerLane; i++) {
+                int d = lane_id + i * WARP_SIZE;
+                dot += q_local[i] * __bfloat162float(k_vec[d]);
+            }
+            dot = warp_reduce_sum(dot) * attn_scale;
+            float score = __shfl_sync(0xffffffff, dot, 0);
+
+            float m_new = fmaxf(m, score);
+            float old_scale = expf(m - m_new);
+            float new_scale = expf(score - m_new);
+            s = s * old_scale + new_scale;
+
+            #pragma unroll
+            for (int i = 0; i < kElemsPerLane; i++) {
+                int d = lane_id + i * WARP_SIZE;
+                float vv = __bfloat162float(v_vec[d]);
+                out_local[i] = out_local[i] * old_scale + vv * new_scale;
+            }
+            m = m_new;
+        }
+    }
+
+    if (debug_out != nullptr && lane_id == 0) {
+        atomicAdd(&sm_tokens, local_tokens);
+        atomicAdd(&sm_block_switches, local_block_switches);
+        atomicAdd(&sm_oob_skips, local_oob_skips);
+        atomicAdd(&sm_tiles_processed, local_tiles);
+    }
+
+    if (lane_id == 0) {
+        sm_m[warp_id] = m;
+        sm_s[warp_id] = s;
+    }
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id + i * WARP_SIZE;
+        sm_out[warp_id * HEAD_DIM + d] = out_local[i];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float g_m = -INFINITY;
+        for (int w = 0; w < active_warps; w++) g_m = fmaxf(g_m, sm_m[w]);
+        float g_s = 0.0f;
+        for (int w = 0; w < active_warps; w++) {
+            float scale = (sm_s[w] > 0.0f) ? expf(sm_m[w] - g_m) : 0.0f;
+            sm_scale[w] = scale;
+            g_s += sm_s[w] * scale;
+        }
+        sm_global_s = g_s;
+    }
+    __syncthreads();
+
+    float inv_s = (sm_global_s > 0.0f) ? (1.0f / sm_global_s) : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id + i * WARP_SIZE;
+        float acc = 0.0f;
+        for (int w = 0; w < active_warps; w++) {
+            acc += sm_out[w * HEAD_DIM + d] * sm_scale[w];
+        }
+        out_vec[d] = __float2bfloat16(acc * inv_s);
+    }
+
+    if (debug_out != nullptr && threadIdx.x == 0) {
+        SplitFlashDecodeDebugRec rec{};
+        rec.cycles = clock64() - sm_clock_begin;
+        rec.cache_len = cache_len;
+        rec.active_warps = active_warps;
+        rec.tokens_processed = sm_tokens;
+        rec.block_switches = sm_block_switches;
+        rec.oob_skips = sm_oob_skips;
+        rec.tiles_processed = sm_tiles_processed;
+        debug_out[q_head] = rec;
     }
 }
 

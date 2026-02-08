@@ -122,12 +122,73 @@ extern "C" void launch_split_decode_gemm(
     }
 
     bool debug_paged_kv = _split_debug_paged_kv_take_ticket();
-    if (debug_paged_kv) {
-        int position_host = -1;
-        if (position_ptr != nullptr) {
-            cudaMemcpyAsync(&position_host, position_ptr, sizeof(int), cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
+    bool debug_flash_decode = _split_debug_flash_decode_take_ticket();
+    int debug_position_host = -1;
+    if ((debug_paged_kv || debug_flash_decode) && position_ptr != nullptr) {
+        cudaMemcpyAsync(&debug_position_host, position_ptr, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+    }
+    SplitFlashDecodeDebugRec* flash_debug_dev = nullptr;
+    SplitFlashDecodeDebugRec* flash_phase_debug_dev = nullptr;
+    SplitFlashDecodeDebugRec* flash_phase_debug_host = nullptr;
+    int flash_phase_debug_cap = 0;
+    if (debug_flash_decode) {
+        static SplitFlashDecodeDebugRec* s_flash_debug_dev = nullptr;
+        static int s_flash_debug_cap = 0;
+        static SplitFlashDecodeDebugRec* s_flash_phase_debug_dev = nullptr;
+        static SplitFlashDecodeDebugRec* s_flash_phase_debug_host = nullptr;
+        static int s_flash_phase_debug_cap = 0;
+        if (s_flash_debug_cap < NUM_Q_HEADS) {
+            if (s_flash_debug_dev != nullptr) {
+                cudaFree(s_flash_debug_dev);
+                s_flash_debug_dev = nullptr;
+                s_flash_debug_cap = 0;
+            }
+            if (cudaMalloc((void**)&s_flash_debug_dev, sizeof(SplitFlashDecodeDebugRec) * NUM_Q_HEADS) == cudaSuccess) {
+                s_flash_debug_cap = NUM_Q_HEADS;
+            }
         }
+        flash_debug_dev = s_flash_debug_dev;
+        flash_phase_debug_dev = s_flash_phase_debug_dev;
+        flash_phase_debug_host = s_flash_phase_debug_host;
+        flash_phase_debug_cap = s_flash_phase_debug_cap;
+        if (flash_debug_dev == nullptr) {
+            std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE debug buffer alloc failed, disable debug output.\n");
+            debug_flash_decode = false;
+        }
+        int need_phase_slots = NUM_Q_HEADS * split_attn_max_chunks;
+        if (debug_flash_decode && need_phase_slots > 0 && flash_phase_debug_cap < need_phase_slots) {
+            if (s_flash_phase_debug_dev != nullptr) {
+                cudaFree(s_flash_phase_debug_dev);
+                s_flash_phase_debug_dev = nullptr;
+            }
+            if (s_flash_phase_debug_host != nullptr) {
+                std::free(s_flash_phase_debug_host);
+                s_flash_phase_debug_host = nullptr;
+            }
+            s_flash_phase_debug_cap = 0;
+            if (cudaMalloc((void**)&s_flash_phase_debug_dev, sizeof(SplitFlashDecodeDebugRec) * need_phase_slots) == cudaSuccess) {
+                s_flash_phase_debug_host = (SplitFlashDecodeDebugRec*)std::malloc(sizeof(SplitFlashDecodeDebugRec) * need_phase_slots);
+                if (s_flash_phase_debug_host != nullptr) {
+                    s_flash_phase_debug_cap = need_phase_slots;
+                } else {
+                    cudaFree(s_flash_phase_debug_dev);
+                    s_flash_phase_debug_dev = nullptr;
+                }
+            }
+            flash_phase_debug_dev = s_flash_phase_debug_dev;
+            flash_phase_debug_host = s_flash_phase_debug_host;
+            flash_phase_debug_cap = s_flash_phase_debug_cap;
+            if (flash_phase_debug_dev == nullptr || flash_phase_debug_host == nullptr) {
+                std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE phase12 debug buffer alloc failed, fallback to light debug.\n");
+            }
+        }
+        flash_phase_debug_dev = s_flash_phase_debug_dev;
+        flash_phase_debug_host = s_flash_phase_debug_host;
+        flash_phase_debug_cap = s_flash_phase_debug_cap;
+    }
+    if (debug_paged_kv) {
+        int position_host = debug_position_host;
         int cache_len = position_host + 1;
         if (cache_len < 0) cache_len = 0;
         if (cache_len > max_seq_len) cache_len = max_seq_len;
@@ -166,6 +227,37 @@ extern "C" void launch_split_decode_gemm(
                     std::printf("\n");
                 }
             }
+        }
+    }
+
+    const int* kv_block_table_attn = kv_block_table;
+    bool kv_identity_fastpath = false;
+    if (kv_block_table != nullptr && kv_block_size > 0) {
+        static const int* s_kv_table_ptr = nullptr;
+        static int s_kv_table_identity = -1;  // -1 unknown, 0 non-identity, 1 identity
+        if (s_kv_table_ptr != kv_block_table || s_kv_table_identity < 0) {
+            s_kv_table_identity = 0;
+            int kv_blocks = (max_seq_len + kv_block_size - 1) / kv_block_size;
+            if (kv_blocks > 0) {
+                int* host_blocks = (int*)std::malloc(sizeof(int) * kv_blocks);
+                if (host_blocks != nullptr) {
+                    cudaMemcpyAsync(host_blocks, kv_block_table, sizeof(int) * kv_blocks, cudaMemcpyDeviceToHost, stream);
+                    cudaStreamSynchronize(stream);
+                    s_kv_table_identity = 1;
+                    for (int i = 0; i < kv_blocks; i++) {
+                        if (host_blocks[i] != i) {
+                            s_kv_table_identity = 0;
+                            break;
+                        }
+                    }
+                    std::free(host_blocks);
+                }
+            }
+            s_kv_table_ptr = kv_block_table;
+        }
+        if (s_kv_table_identity == 1) {
+            kv_block_table_attn = nullptr;
+            kv_identity_fastpath = true;
         }
     }
 
@@ -337,9 +429,255 @@ extern "C" void launch_split_decode_gemm(
 
         // 4) Decode attention over cache (BF16 in/out)
         int dbg_attn = dbg_begin(SPLIT_STAGE_ATTN, layer);
-        int attn_warps = _split_attn_warps_per_head();
         int attn_impl = _split_attn_impl();
-        if (attn_impl == 2 && split_attn_chunk_size > 0 && split_attn_max_chunks > 0 &&
+        int attn_warps = (attn_impl == 3) ? _split_flash_attn_warps_per_head()
+                                          : _split_attn_warps_per_head();
+        if (attn_impl == 3) {
+            bool flash_use_split_reduce =
+                (split_attn_chunk_size > 0 && split_attn_max_chunks > 0 &&
+                 split_attn_partial_m != nullptr && split_attn_partial_s != nullptr &&
+                 split_attn_partial_out != nullptr);
+            if (flash_use_split_reduce) {
+                int blocks = NUM_Q_HEADS * split_attn_max_chunks;
+                int threads = attn_warps * WARP_SIZE;
+                decode_attention_cache_flash_phase1_kernel<<<blocks, threads, 0, stream>>>(
+                    (const __nv_bfloat16*)q_proj_bf16,
+                    (const __nv_bfloat16*)layer_k_cache,
+                    (const __nv_bfloat16*)layer_v_cache,
+                    (float*)split_attn_partial_m,
+                    (float*)split_attn_partial_s,
+                    (float*)split_attn_partial_out,
+                    NUM_Q_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    max_seq_len,
+                    attn_scale,
+                    attn_warps,
+                    split_attn_chunk_size,
+                    split_attn_max_chunks,
+                    kv_block_table_attn,
+                    kv_block_size,
+                    position_ptr,
+                    (debug_flash_decode && flash_phase_debug_dev != nullptr &&
+                     flash_phase_debug_cap >= blocks)
+                        ? flash_phase_debug_dev
+                        : nullptr
+                );
+                decode_attention_cache_splitk_phase2_kernel<<<NUM_Q_HEADS, 128, 0, stream>>>(
+                    (const float*)split_attn_partial_m,
+                    (const float*)split_attn_partial_s,
+                    (const float*)split_attn_partial_out,
+                    (__nv_bfloat16*)attn_out_bf16,
+                    NUM_Q_HEADS,
+                    HEAD_DIM,
+                    split_attn_chunk_size,
+                    split_attn_max_chunks,
+                    position_ptr
+                );
+                if (debug_flash_decode) {
+                    int cache_len_dbg = debug_position_host + 1;
+                    if (cache_len_dbg < 0) cache_len_dbg = 0;
+                    if (cache_len_dbg > max_seq_len) cache_len_dbg = max_seq_len;
+                    int chunks_dbg = (cache_len_dbg + split_attn_chunk_size - 1) / split_attn_chunk_size;
+                    if (chunks_dbg > split_attn_max_chunks) chunks_dbg = split_attn_max_chunks;
+                    if (chunks_dbg < 1) chunks_dbg = 1;
+                    int used_blocks = NUM_Q_HEADS * chunks_dbg;
+                    bool have_phase_debug =
+                        (flash_phase_debug_dev != nullptr && flash_phase_debug_host != nullptr &&
+                         flash_phase_debug_cap >= (NUM_Q_HEADS * split_attn_max_chunks));
+                    if (have_phase_debug) {
+                        cudaMemcpyAsync(
+                            flash_phase_debug_host,
+                            flash_phase_debug_dev,
+                            sizeof(SplitFlashDecodeDebugRec) * used_blocks,
+                            cudaMemcpyDeviceToHost,
+                            stream);
+                        cudaStreamSynchronize(stream);
+                    }
+
+                    unsigned long long head_cycles[NUM_Q_HEADS];
+                    int head_tokens[NUM_Q_HEADS];
+                    int head_switches[NUM_Q_HEADS];
+                    int head_chunks[NUM_Q_HEADS];
+                    for (int h = 0; h < NUM_Q_HEADS; h++) {
+                        head_cycles[h] = 0;
+                        head_tokens[h] = 0;
+                        head_switches[h] = 0;
+                        head_chunks[h] = 0;
+                    }
+                    long long sum_tokens = 0;
+                    long long sum_switches = 0;
+                    long long sum_oob = 0;
+                    long long sum_tiles = 0;
+                    unsigned long long sum_cycles = 0;
+                    int cache_len_from_rec = cache_len_dbg;
+                    int warps_from_rec = attn_warps;
+                    if (have_phase_debug) {
+                        for (int c = 0; c < chunks_dbg; c++) {
+                            for (int h = 0; h < NUM_Q_HEADS; h++) {
+                                int idx = c * NUM_Q_HEADS + h;
+                                const SplitFlashDecodeDebugRec& rec = flash_phase_debug_host[idx];
+                                head_cycles[h] += rec.cycles;
+                                head_tokens[h] += rec.tokens_processed;
+                                head_switches[h] += rec.block_switches;
+                                head_chunks[h] += 1;
+                                sum_cycles += rec.cycles;
+                                sum_tokens += rec.tokens_processed;
+                                sum_switches += rec.block_switches;
+                                sum_oob += rec.oob_skips;
+                                sum_tiles += rec.tiles_processed;
+                                if (c == 0 && h == 0) {
+                                    cache_len_from_rec = rec.cache_len;
+                                    warps_from_rec = rec.active_warps;
+                                }
+                            }
+                        }
+                    }
+
+                    double avg_cycles = (used_blocks > 0) ? (double(sum_cycles) / double(used_blocks)) : 0.0;
+                    std::printf(
+                        "[MEGAQWEN_DEBUG] FLASH_DECODE layer=%02d token_pos=%d mode=phase12 cache_len=%d warps=%d chunk=%d chunks=%d blocks=%d avg_cycles=%.1f tokens=%lld block_switches=%lld oob=%lld tiles=%lld\n",
+                        layer,
+                        debug_position_host,
+                        cache_len_from_rec,
+                        warps_from_rec,
+                        split_attn_chunk_size,
+                        chunks_dbg,
+                        used_blocks,
+                        avg_cycles,
+                        sum_tokens,
+                        sum_switches,
+                        sum_oob,
+                        sum_tiles);
+                    if (debug_flash_decode && layer == 0) {
+                        std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE kv_map=%s\n",
+                                    kv_identity_fastpath ? "contiguous_fastpath" : "paged_table");
+                    }
+
+                    if (have_phase_debug) {
+                        struct FlashPair {
+                            unsigned long long cycles;
+                            int head;
+                        };
+                        FlashPair pairs[NUM_Q_HEADS];
+                        for (int h = 0; h < NUM_Q_HEADS; h++) {
+                            pairs[h] = FlashPair{head_cycles[h], h};
+                        }
+                        for (int i = 0; i < NUM_Q_HEADS; i++) {
+                            for (int j = i + 1; j < NUM_Q_HEADS; j++) {
+                                if (pairs[j].cycles > pairs[i].cycles) {
+                                    FlashPair tmp = pairs[i];
+                                    pairs[i] = pairs[j];
+                                    pairs[j] = tmp;
+                                }
+                            }
+                        }
+                        int topk = _split_debug_flash_head_topk();
+                        if (topk > NUM_Q_HEADS) topk = NUM_Q_HEADS;
+                        std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE head hotspot (phase12 cycles/tokens/switches/chunks):");
+                        for (int i = 0; i < topk; i++) {
+                            int h = pairs[i].head;
+                            std::printf(" H%02d=%llu/%d/%d/%d",
+                                        h,
+                                        (unsigned long long)head_cycles[h],
+                                        head_tokens[h],
+                                        head_switches[h],
+                                        head_chunks[h]);
+                        }
+                        std::printf("\n");
+                    }
+                }
+            } else {
+                int threads = attn_warps * WARP_SIZE;
+                decode_attention_cache_flash_decode_kernel<<<NUM_Q_HEADS, threads, 0, stream>>>(
+                    (const __nv_bfloat16*)q_proj_bf16,
+                    (const __nv_bfloat16*)layer_k_cache,
+                    (const __nv_bfloat16*)layer_v_cache,
+                    (__nv_bfloat16*)attn_out_bf16,
+                    NUM_Q_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    max_seq_len,
+                    attn_scale,
+                    attn_warps,
+                    kv_block_table_attn,
+                    kv_block_size,
+                    position_ptr,
+                    debug_flash_decode ? flash_debug_dev : nullptr
+                );
+                if (debug_flash_decode && flash_debug_dev != nullptr) {
+                    SplitFlashDecodeDebugRec flash_debug_host[NUM_Q_HEADS];
+                    cudaMemcpyAsync(
+                        flash_debug_host,
+                        flash_debug_dev,
+                        sizeof(SplitFlashDecodeDebugRec) * NUM_Q_HEADS,
+                        cudaMemcpyDeviceToHost,
+                        stream);
+                    cudaStreamSynchronize(stream);
+
+                    unsigned long long sum_cycles = 0;
+                    long long sum_tokens = 0;
+                    long long sum_switches = 0;
+                    long long sum_oob = 0;
+                    long long sum_tiles = 0;
+                    int cache_len_dbg = 0;
+                    int active_warps_dbg = 0;
+                    for (int h = 0; h < NUM_Q_HEADS; h++) {
+                        sum_cycles += flash_debug_host[h].cycles;
+                        sum_tokens += flash_debug_host[h].tokens_processed;
+                        sum_switches += flash_debug_host[h].block_switches;
+                        sum_oob += flash_debug_host[h].oob_skips;
+                        sum_tiles += flash_debug_host[h].tiles_processed;
+                        if (h == 0) {
+                            cache_len_dbg = flash_debug_host[h].cache_len;
+                            active_warps_dbg = flash_debug_host[h].active_warps;
+                        }
+                    }
+                    double avg_cycles = double(sum_cycles) / double(NUM_Q_HEADS);
+                    std::printf(
+                        "[MEGAQWEN_DEBUG] FLASH_DECODE layer=%02d token_pos=%d cache_len=%d warps=%d avg_cycles=%.1f tokens=%lld block_switches=%lld oob=%lld tiles=%lld\n",
+                        layer,
+                        debug_position_host,
+                        cache_len_dbg,
+                        active_warps_dbg,
+                        avg_cycles,
+                        sum_tokens,
+                        sum_switches,
+                        sum_oob,
+                        sum_tiles);
+
+                    struct FlashPair {
+                        unsigned long long cycles;
+                        int head;
+                    };
+                    FlashPair pairs[NUM_Q_HEADS];
+                    for (int h = 0; h < NUM_Q_HEADS; h++) {
+                        pairs[h] = FlashPair{flash_debug_host[h].cycles, h};
+                    }
+                    for (int i = 0; i < NUM_Q_HEADS; i++) {
+                        for (int j = i + 1; j < NUM_Q_HEADS; j++) {
+                            if (pairs[j].cycles > pairs[i].cycles) {
+                                FlashPair tmp = pairs[i];
+                                pairs[i] = pairs[j];
+                                pairs[j] = tmp;
+                            }
+                        }
+                    }
+                    int topk = _split_debug_flash_head_topk();
+                    if (topk > NUM_Q_HEADS) topk = NUM_Q_HEADS;
+                    std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE head hotspot (cycles/tokens/switches):");
+                    for (int i = 0; i < topk; i++) {
+                        int h = pairs[i].head;
+                        std::printf(" H%02d=%llu/%d/%d",
+                                    h,
+                                    (unsigned long long)flash_debug_host[h].cycles,
+                                    flash_debug_host[h].tokens_processed,
+                                    flash_debug_host[h].block_switches);
+                    }
+                    std::printf("\n");
+                }
+            }
+        } else if (attn_impl == 2 && split_attn_chunk_size > 0 && split_attn_max_chunks > 0 &&
             split_attn_partial_m != nullptr && split_attn_partial_s != nullptr && split_attn_partial_out != nullptr) {
             int blocks = NUM_Q_HEADS * split_attn_max_chunks;
             int threads = attn_warps * WARP_SIZE;

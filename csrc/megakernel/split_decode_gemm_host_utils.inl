@@ -297,12 +297,15 @@ static inline int _split_kv_block_size() {
 }
 
 static inline int _split_attn_impl() {
-    // 0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase)
+    // 0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase), 3=flash_decode(tile-online)
     static int mode = -1;
     if (mode >= 0) return mode;
     const char* s = std::getenv("MEGAQWEN_SPLIT_ATTN_IMPL");
     if (s == nullptr || std::strcmp(s, "") == 0) {
         mode = 2;
+    } else if (std::strcmp(s, "flash_decode") == 0 || std::strcmp(s, "flashdecode") == 0 ||
+               std::strcmp(s, "flash") == 0 || std::strcmp(s, "3") == 0) {
+        mode = 3;
     } else if (std::strcmp(s, "splitk2") == 0 || std::strcmp(s, "v2") == 0 ||
                std::strcmp(s, "2") == 0) {
         mode = 2;
@@ -324,6 +327,7 @@ static inline const char* _split_attn_impl_name() {
     int impl = _split_attn_impl();
     if (impl == 0) return "legacy";
     if (impl == 1) return "splitk";
+    if (impl == 3) return "flash_decode";
     return "splitk2";
 }
 
@@ -335,6 +339,27 @@ static inline int _split_attn_warps_per_head() {
     if (s != nullptr && std::strcmp(s, "") != 0) {
         int parsed = std::atoi(s);
         if (parsed > 0) v = parsed;
+    }
+    if (v < 1) v = 1;
+    if (v > 8) v = 8;
+    warps = v;
+    return warps;
+}
+
+static inline int _split_flash_attn_warps_per_head() {
+    static int warps = -1;
+    if (warps > 0) return warps;
+    int v = 4;  // flash-decode on AD102 usually prefers fewer warps than splitk2.
+    const char* s = std::getenv("MEGAQWEN_SPLIT_FLASH_WARPS");
+    if (s != nullptr && std::strcmp(s, "") != 0) {
+        int parsed = std::atoi(s);
+        if (parsed > 0) v = parsed;
+    } else {
+        const char* s_attn = std::getenv("MEGAQWEN_SPLIT_ATTN_WARPS");
+        if (s_attn != nullptr && std::strcmp(s_attn, "") != 0) {
+            int parsed = std::atoi(s_attn);
+            if (parsed > 0) v = parsed;
+        }
     }
     if (v < 1) v = 1;
     if (v > 8) v = 8;
@@ -472,6 +497,57 @@ static inline bool _split_debug_paged_kv_take_ticket() {
     static long long counter = 0;
     long long idx = counter++;
     return idx < static_cast<long long>(_split_debug_paged_kv_tokens());
+}
+
+static inline bool _split_debug_flash_decode_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_DEBUG_FLASH_DECODE");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
+static inline int _split_debug_flash_decode_tokens() {
+    static int v = -1;
+    if (v >= 0) return v;
+    v = 1;
+    const char* s = std::getenv("MEGAQWEN_DEBUG_FLASH_TOKENS");
+    if (s == nullptr || std::strcmp(s, "") == 0) return v;
+    if (std::strcmp(s, "all") == 0) {
+        v = 1000000000;
+        return v;
+    }
+    int p = std::atoi(s);
+    if (p >= 0) v = p;
+    return v;
+}
+
+static inline bool _split_debug_flash_decode_take_ticket() {
+    if (!_split_debug_flash_decode_enabled()) return false;
+    static long long counter = 0;
+    long long idx = counter++;
+    return idx < static_cast<long long>(_split_debug_flash_decode_tokens());
+}
+
+static inline int _split_debug_flash_head_topk() {
+    static int v = -1;
+    if (v > 0) return v;
+    v = 8;
+    const char* s = std::getenv("MEGAQWEN_DEBUG_FLASH_HEAD_TOPK");
+    if (s != nullptr && std::strcmp(s, "") != 0) {
+        int p = std::atoi(s);
+        if (p > 0) v = p;
+    }
+    if (v < 1) v = 1;
+    if (v > 16) v = 16;
+    return v;
 }
 
 enum SplitStageId : int {
