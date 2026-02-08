@@ -104,19 +104,22 @@ _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
     # Decode: use split_gemm + GPU-side greedy loop.
     "MEGAQWEN_DECODE_BACKEND": "split_gemm",
     "MEGAQWEN_DECODE_GPU_LOOP": "1",
-    "MEGAQWEN_SPLIT_ATTN_IMPL": "splitk2",
-    "MEGAQWEN_SPLIT_ATTN_WARPS": "8",
-    "MEGAQWEN_SPLIT_ATTN_CHUNK": "128",
+    # Aggressive flash-decode defaults (can still be overridden by env).
+    "MEGAQWEN_SPLIT_ATTN_IMPL": "flash_decode",
+    "MEGAQWEN_SPLIT_FLASH_WARPS": "4",
+    "MEGAQWEN_SPLIT_ATTN_CHUNK": "64",
     "MEGAQWEN_SPLIT_QKV_GEMM_IMPL": "gemmex",
-    # Keep prefill stage logs on by default for profiling reproducibility.
-    "MEGAQWEN_DEBUG_PREFILL_STAGE": "1",
-    "MEGAQWEN_DEBUG_PREFILL_STAGE_SKIP": "1",
-    # Keep decode split-stage logs on by default (one-shot, skip warmup).
-    "MEGAQWEN_DEBUG_SPLIT_STAGE": "1",
-    "MEGAQWEN_DEBUG_SPLIT_STAGE_SKIP": "1",
-    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG": "1",
-    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG_STRIDE": "16",
-    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG_EXACT": "0",
+    "MEGAQWEN_SPLIT_KV_LAYOUT": "paged",
+    "MEGAQWEN_SPLIT_KV_BLOCK_SIZE": "16",
+    "MEGAQWEN_SPLIT_QKV_W4": "1",
+    "MEGAQWEN_SPLIT_O_W4": "1",
+    "MEGAQWEN_SPLIT_FFN_W4": "1",
+    "MEGAQWEN_SPLIT_FFN_W4_FUSED": "1",
+    # Debug logs are OFF by default; enable explicitly when profiling internals.
+    "MEGAQWEN_DEBUG_PREFILL_STAGE": "0",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE": "0",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG": "0",
+    "MEGAQWEN_DEBUG_FLASH_DECODE": "0",
 }
 
 
