@@ -311,6 +311,22 @@ static inline bool _split_kv_fp8_enabled() {
     return mode == 1;
 }
 
+static inline bool _split_kv_fp8_only_enabled() {
+    // default on: when KV FP8 is enabled, decode path writes FP8 cache only.
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_KV_FP8_ONLY");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "1") == 0 ||
+        std::strcmp(s, "true") == 0 ||
+        std::strcmp(s, "True") == 0) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+    return mode == 1;
+}
+
 static inline int _split_attn_impl() {
     // 0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase), 3=flash_decode(tile-online)
     static int mode = -1;
@@ -580,6 +596,21 @@ static inline int _split_debug_flash_head_topk() {
     return v;
 }
 
+static inline bool _split_debug_flash_breakdown_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_DEBUG_FLASH_BREAKDOWN");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
 enum SplitStageId : int {
     SPLIT_STAGE_EMBED = 0,
     SPLIT_STAGE_RMS1 = 1,
@@ -709,10 +740,11 @@ extern "C" void split_debug_stage_print_summary() {
     printf("         gemv=%5lld\n", agg.down_gemv);
     printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
            _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
-    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d flash_parts=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
+    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d flash_parts=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
            _split_kv_layout_paged_enabled() ? "paged" : "contiguous",
            _split_kv_block_size(),
            _split_kv_fp8_enabled() ? 1 : 0,
+           _split_kv_fp8_only_enabled() ? 1 : 0,
            _split_flash_parts(),
            _split_qkv_w4_enabled() ? 1 : 0,
            agg.qkv_w4,

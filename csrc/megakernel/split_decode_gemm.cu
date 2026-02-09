@@ -88,6 +88,19 @@ __device__ __forceinline__ float kv_cache_load_elem(
     return __bfloat162float(bf16_vec[d]);
 }
 
+union SplitFp8x4Pack {
+    uint32_t raw;
+    __nv_fp8_e4m3 v[4];
+};
+
+__device__ __forceinline__ SplitFp8x4Pack split_load_fp8x4(
+    const __nv_fp8_e4m3* __restrict__ ptr
+) {
+    SplitFp8x4Pack pack;
+    pack.raw = *reinterpret_cast<const uint32_t*>(ptr);
+    return pack;
+}
+
 // Quantize existing BF16 KV cache into FP8 cache for [start_pos, end_pos).
 // - k/v scale shape: [num_layers, num_kv_heads] (one scale per layer/head)
 // - k/v fp8 shape:   [num_layers, num_kv_heads, max_seq_len, head_dim]
@@ -227,6 +240,7 @@ __global__ void decode_qk_norm_rope_cache_kernel(
     float* __restrict__ k_scale_cache,        // optional [num_kv_heads]
     float* __restrict__ v_scale_cache,        // optional [num_kv_heads]
     int kv_fp8_enabled,
+    int kv_fp8_only,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -302,6 +316,7 @@ __global__ void decode_qk_norm_rope_cache_kernel(
         float* v_scale_ptr = nullptr;
         float k_scale = 1.0f;
         float v_scale = 1.0f;
+        bool use_fp8_only = (kv_fp8_enabled && kv_fp8_only);
         if (kv_fp8_enabled) {
             k_cache_head_fp8 = k_cache_fp8 + head * max_seq_len * head_dim + position_physical * head_dim;
             v_cache_head_fp8 = v_cache_fp8 + head * max_seq_len * head_dim + position_physical * head_dim;
@@ -347,10 +362,12 @@ __global__ void decode_qk_norm_rope_cache_kernel(
         for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
             float out = smem_normed[i];
             __nv_bfloat16 out_bf16 = __float2bfloat16(out);
-            k_head[i] = out_bf16;
-            k_cache_head[i] = out_bf16;
             __nv_bfloat16 vv_bf16 = v_head[i];
-            v_cache_head[i] = vv_bf16;
+            if (!use_fp8_only) {
+                k_head[i] = out_bf16;
+                k_cache_head[i] = out_bf16;
+                v_cache_head[i] = vv_bf16;
+            }
             if (kv_fp8_enabled) {
                 float inv_ks = 1.0f / k_scale;
                 float inv_vs = 1.0f / v_scale;
@@ -680,11 +697,6 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
 
     const __nv_bfloat16* q_vec = q + q_head * head_dim;
     float q_local[kElemsPerLane];
-    #pragma unroll
-    for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
-        q_local[i] = __bfloat162float(q_vec[d]);
-    }
 
     float m = -INFINITY;
     float s = 0.0f;
@@ -777,6 +789,16 @@ __global__ void decode_attention_cache_splitk_phase1_kernel(
 
 struct SplitFlashDecodeDebugRec {
     unsigned long long cycles;
+    unsigned long long map_cycles;
+    unsigned long long qk_cycles;
+    unsigned long long qk_load_cycles;
+    unsigned long long qk_fma_cycles;
+    unsigned long long qk_reduce_cycles;
+    unsigned long long softmax_cycles;
+    unsigned long long value_cycles;
+    unsigned long long value_load_cycles;
+    unsigned long long value_fma_cycles;
+    unsigned long long merge_cycles;
     int cache_len;
     int active_warps;
     int tokens_processed;
@@ -789,7 +811,8 @@ struct SplitFlashDecodeDebugRec {
 // - One block handles one (q_head, chunk).
 // - Warps process contiguous token tiles inside the chunk to improve paged-KV locality.
 // - Output format is shared with splitk phase-2 reducer.
-__global__ void decode_attention_cache_flash_phase1_kernel(
+template <bool KV_FP8>
+__global__ void decode_attention_cache_flash_phase1_kernel_t(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
@@ -797,7 +820,6 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
     const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
     const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
-    int kv_fp8_enabled,
     float* __restrict__ partial_m,                   // [max_chunks, num_q_heads]
     float* __restrict__ partial_s,                   // [max_chunks, num_q_heads]
     float* __restrict__ partial_out,                 // [max_chunks, num_q_heads, head_dim]
@@ -829,6 +851,16 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     __shared__ int sm_switches;
     __shared__ int sm_oob;
     __shared__ int sm_tiles;
+    __shared__ unsigned long long sm_map_cycles;
+    __shared__ unsigned long long sm_qk_cycles;
+    __shared__ unsigned long long sm_qk_load_cycles;
+    __shared__ unsigned long long sm_qk_fma_cycles;
+    __shared__ unsigned long long sm_qk_reduce_cycles;
+    __shared__ unsigned long long sm_softmax_cycles;
+    __shared__ unsigned long long sm_value_cycles;
+    __shared__ unsigned long long sm_value_load_cycles;
+    __shared__ unsigned long long sm_value_fma_cycles;
+    __shared__ unsigned long long sm_merge_cycles;
     __shared__ unsigned long long sm_clock_begin;
 
     if (head_dim != HEAD_DIM) return;
@@ -875,6 +907,16 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
             sm_switches = 0;
             sm_oob = 0;
             sm_tiles = 0;
+            sm_map_cycles = 0;
+            sm_qk_cycles = 0;
+            sm_qk_load_cycles = 0;
+            sm_qk_fma_cycles = 0;
+            sm_qk_reduce_cycles = 0;
+            sm_softmax_cycles = 0;
+            sm_value_cycles = 0;
+            sm_value_load_cycles = 0;
+            sm_value_fma_cycles = 0;
+            sm_merge_cycles = 0;
             sm_clock_begin = clock64();
         }
     }
@@ -888,11 +930,6 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
 
     const __nv_bfloat16* q_vec = q + q_head * head_dim;
     float q_local[kElemsPerLane];
-    #pragma unroll
-    for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
-        q_local[i] = __bfloat162float(q_vec[d]);
-    }
 
     float m = -INFINITY;
     float s = 0.0f;
@@ -900,14 +937,25 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * head_dim;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * head_dim;
-    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
-    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * head_dim) : nullptr;
-    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
-    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
-    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
-    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
-    if (k_scale < 1.0e-8f) k_scale = 1.0f;
-    if (v_scale < 1.0e-8f) v_scale = 1.0f;
+    const __nv_fp8_e4m3* k_base_fp8 = nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = nullptr;
+    float k_scale = 1.0f;
+    float v_scale = 1.0f;
+    if constexpr (KV_FP8) {
+        k_base_fp8 = k_cache_fp8 + kv_head * max_seq_len * head_dim;
+        v_base_fp8 = v_cache_fp8 + kv_head * max_seq_len * head_dim;
+        k_scale = k_scale_cache[kv_head];
+        v_scale = v_scale_cache[kv_head];
+        if (k_scale < 1.0e-8f) k_scale = 1.0f;
+        if (v_scale < 1.0e-8f) v_scale = 1.0f;
+    }
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id * kElemsPerLane + i;
+        float qv = __bfloat162float(q_vec[d]);
+        if constexpr (KV_FP8) qv *= k_scale;
+        q_local[i] = qv;
+    }
     bool paged = (kv_block_table != nullptr && kv_block_size > 0);
     bool use_blocking = (kv_block_size > 0);
 
@@ -916,6 +964,16 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
         int local_switches = 0;
         int local_oob = 0;
         int local_tiles = 0;
+        unsigned long long local_map_cycles = 0;
+        unsigned long long local_qk_cycles = 0;
+        unsigned long long local_qk_load_cycles = 0;
+        unsigned long long local_qk_fma_cycles = 0;
+        unsigned long long local_qk_reduce_cycles = 0;
+        unsigned long long local_softmax_cycles = 0;
+        unsigned long long local_value_cycles = 0;
+        unsigned long long local_value_load_cycles = 0;
+        unsigned long long local_value_fma_cycles = 0;
+        bool debug_lane = (debug_out != nullptr && lane_id == 0);
         int block_size = (use_blocking ? kv_block_size : max_seq_len);
         if (block_size <= 0) block_size = max_seq_len;
         if (block_size <= 0) block_size = 1;
@@ -946,10 +1004,13 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
                 local_tiles += 1;
                 #pragma unroll
                 for (int ti = 0; ti < kFlashTile; ti++) {
+                    unsigned long long t_map_begin = 0;
+                    if (debug_lane) t_map_begin = clock64();
                     int t = tile_start + ti;
                     if (t >= block_token_end) break;
                     int in_block = t - logical_block * block_size;
                     int physical_t = physical_block_base + in_block;
+                    if (debug_lane) local_map_cycles += (clock64() - t_map_begin);
                     if (physical_t >= max_seq_len) {
                         local_oob += 1;
                         continue;
@@ -958,28 +1019,83 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
 
                     const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
                     const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
-                    const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * head_dim) : nullptr;
-                    const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * head_dim) : nullptr;
+                    const __nv_fp8_e4m3* k_vec_fp8 = KV_FP8 ? (k_base_fp8 + physical_t * head_dim) : nullptr;
+                    const __nv_fp8_e4m3* v_vec_fp8 = KV_FP8 ? (v_base_fp8 + physical_t * head_dim) : nullptr;
+                    unsigned long long t_qk_begin = 0;
+                    if (debug_lane) t_qk_begin = clock64();
                     float dot = 0.0f;
-                    #pragma unroll
-                    for (int i = 0; i < kElemsPerLane; i++) {
-                        int d = lane_id + i * WARP_SIZE;
-                        dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
+                    if constexpr (KV_FP8) {
+                        int d0 = lane_id * kElemsPerLane;
+                        unsigned long long t_load_begin = 0;
+                        if (debug_lane) t_load_begin = clock64();
+                        SplitFp8x4Pack kpack = split_load_fp8x4(k_vec_fp8 + d0);
+                        if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                        unsigned long long t_fma_begin = 0;
+                        if (debug_lane) t_fma_begin = clock64();
+                        dot += q_local[0] * static_cast<float>(kpack.v[0]);
+                        dot += q_local[1] * static_cast<float>(kpack.v[1]);
+                        dot += q_local[2] * static_cast<float>(kpack.v[2]);
+                        dot += q_local[3] * static_cast<float>(kpack.v[3]);
+                        if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+                    } else {
+                        #pragma unroll
+                        for (int i = 0; i < kElemsPerLane; i++) {
+                            int d = lane_id * kElemsPerLane + i;
+                            unsigned long long t_load_begin = 0;
+                            if (debug_lane) t_load_begin = clock64();
+                            float kval = __bfloat162float(k_vec[d]);
+                            if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                            unsigned long long t_fma_begin = 0;
+                            if (debug_lane) t_fma_begin = clock64();
+                            dot += q_local[i] * kval;
+                            if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+                        }
                     }
+                    unsigned long long t_qk_reduce_begin = 0;
+                    if (debug_lane) t_qk_reduce_begin = clock64();
                     dot = warp_reduce_sum(dot) * attn_scale;
                     float score = __shfl_sync(0xffffffff, dot, 0);
+                    if (debug_lane) local_qk_reduce_cycles += (clock64() - t_qk_reduce_begin);
+                    if (debug_lane) local_qk_cycles += (clock64() - t_qk_begin);
 
+                    unsigned long long t_softmax_begin = 0;
+                    if (debug_lane) t_softmax_begin = clock64();
                     float m_new = fmaxf(m, score);
                     float old_scale = expf(m - m_new);
                     float new_scale = expf(score - m_new);
                     s = s * old_scale + new_scale;
+                    if (debug_lane) local_softmax_cycles += (clock64() - t_softmax_begin);
 
-                    #pragma unroll
-                    for (int i = 0; i < kElemsPerLane; i++) {
-                        int d = lane_id + i * WARP_SIZE;
-                        float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
-                        out_local[i] = out_local[i] * old_scale + vv * new_scale;
+                    unsigned long long t_value_begin = 0;
+                    if (debug_lane) t_value_begin = clock64();
+                    if constexpr (KV_FP8) {
+                        int d0 = lane_id * kElemsPerLane;
+                        unsigned long long t_vload_begin = 0;
+                        if (debug_lane) t_vload_begin = clock64();
+                        SplitFp8x4Pack vpack = split_load_fp8x4(v_vec_fp8 + d0);
+                        if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                        unsigned long long t_vfma_begin = 0;
+                        if (debug_lane) t_vfma_begin = clock64();
+                        out_local[0] = out_local[0] * old_scale + static_cast<float>(vpack.v[0]) * new_scale;
+                        out_local[1] = out_local[1] * old_scale + static_cast<float>(vpack.v[1]) * new_scale;
+                        out_local[2] = out_local[2] * old_scale + static_cast<float>(vpack.v[2]) * new_scale;
+                        out_local[3] = out_local[3] * old_scale + static_cast<float>(vpack.v[3]) * new_scale;
+                        if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
+                    } else {
+                        #pragma unroll
+                        for (int i = 0; i < kElemsPerLane; i++) {
+                            int d = lane_id * kElemsPerLane + i;
+                            unsigned long long t_vload_begin = 0;
+                            if (debug_lane) t_vload_begin = clock64();
+                            float vv = __bfloat162float(v_vec[d]);
+                            if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                            unsigned long long t_vfma_begin = 0;
+                            if (debug_lane) t_vfma_begin = clock64();
+                            out_local[i] = out_local[i] * old_scale + vv * new_scale;
+                            if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
+                        }
                     }
+                    if (debug_lane) local_value_cycles += (clock64() - t_value_begin);
                     m = m_new;
                 }
             }
@@ -989,6 +1105,15 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
             atomicAdd(&sm_switches, local_switches);
             atomicAdd(&sm_oob, local_oob);
             atomicAdd(&sm_tiles, local_tiles);
+            atomicAdd(&sm_map_cycles, local_map_cycles);
+            atomicAdd(&sm_qk_cycles, local_qk_cycles);
+            atomicAdd(&sm_qk_load_cycles, local_qk_load_cycles);
+            atomicAdd(&sm_qk_fma_cycles, local_qk_fma_cycles);
+            atomicAdd(&sm_qk_reduce_cycles, local_qk_reduce_cycles);
+            atomicAdd(&sm_softmax_cycles, local_softmax_cycles);
+            atomicAdd(&sm_value_cycles, local_value_cycles);
+            atomicAdd(&sm_value_load_cycles, local_value_load_cycles);
+            atomicAdd(&sm_value_fma_cycles, local_value_fma_cycles);
         }
     }
 
@@ -998,12 +1123,14 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
     }
     #pragma unroll
     for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
+        int d = lane_id * kElemsPerLane + i;
         sm_out[warp_id * HEAD_DIM + d] = (warp_id < active_warps) ? out_local[i] : 0.0f;
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
+        unsigned long long merge_begin = 0;
+        if (debug_out != nullptr) merge_begin = clock64();
         float g_m = -INFINITY;
         for (int w = 0; w < active_warps; w++) g_m = fmaxf(g_m, sm_m[w]);
         float g_s = 0.0f;
@@ -1014,18 +1141,20 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
         }
         sm_global_m = g_m;
         sm_global_s = g_s;
+        if (debug_out != nullptr) sm_merge_cycles += (clock64() - merge_begin);
     }
     __syncthreads();
 
     int idx = (part_idx * max_chunks + chunk_idx) * num_q_heads + q_head;
     #pragma unroll
     for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
+        int d = lane_id * kElemsPerLane + i;
         float acc = 0.0f;
         #pragma unroll
         for (int w = 0; w < kMaxWarps; w++) {
             if (w < active_warps) acc += sm_out[w * HEAD_DIM + d] * sm_scale[w];
         }
+        if constexpr (KV_FP8) acc *= v_scale;
         partial_out[idx * HEAD_DIM + d] = acc;
     }
     if (threadIdx.x == 0) {
@@ -1040,6 +1169,16 @@ __global__ void decode_attention_cache_flash_phase1_kernel(
             rec.block_switches = sm_switches;
             rec.oob_skips = sm_oob;
             rec.tiles_processed = sm_tiles;
+            rec.map_cycles = sm_map_cycles;
+            rec.qk_cycles = sm_qk_cycles;
+            rec.qk_load_cycles = sm_qk_load_cycles;
+            rec.qk_fma_cycles = sm_qk_fma_cycles;
+            rec.qk_reduce_cycles = sm_qk_reduce_cycles;
+            rec.softmax_cycles = sm_softmax_cycles;
+            rec.value_cycles = sm_value_cycles;
+            rec.value_load_cycles = sm_value_load_cycles;
+            rec.value_fma_cycles = sm_value_fma_cycles;
+            rec.merge_cycles = sm_merge_cycles;
             debug_out[idx] = rec;
         }
     }
@@ -1162,7 +1301,8 @@ __global__ void decode_attention_cache_splitk_phase2_kernel(
 // - One block per q_head.
 // - Warps split cache by contiguous ranges (better locality for paged KV).
 // - Per-warp online softmax summary is reduced inside block.
-__global__ void decode_attention_cache_flash_decode_kernel(
+template <bool KV_FP8>
+__global__ void decode_attention_cache_flash_decode_kernel_t(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,       // [num_kv_heads, max_seq_len, head_dim]
@@ -1170,7 +1310,6 @@ __global__ void decode_attention_cache_flash_decode_kernel(
     const __nv_fp8_e4m3* __restrict__ v_cache_fp8,   // optional [num_kv_heads, max_seq_len, head_dim]
     const float* __restrict__ k_scale_cache,         // optional [num_kv_heads]
     const float* __restrict__ v_scale_cache,         // optional [num_kv_heads]
-    int kv_fp8_enabled,
     __nv_bfloat16* __restrict__ out,                 // [num_q_heads, head_dim]
     int num_q_heads,
     int num_kv_heads,
@@ -1199,6 +1338,16 @@ __global__ void decode_attention_cache_flash_decode_kernel(
     __shared__ int sm_block_switches;
     __shared__ int sm_oob_skips;
     __shared__ int sm_tiles_processed;
+    __shared__ unsigned long long sm_map_cycles;
+    __shared__ unsigned long long sm_qk_cycles;
+    __shared__ unsigned long long sm_qk_load_cycles;
+    __shared__ unsigned long long sm_qk_fma_cycles;
+    __shared__ unsigned long long sm_qk_reduce_cycles;
+    __shared__ unsigned long long sm_softmax_cycles;
+    __shared__ unsigned long long sm_value_cycles;
+    __shared__ unsigned long long sm_value_load_cycles;
+    __shared__ unsigned long long sm_value_fma_cycles;
+    __shared__ unsigned long long sm_merge_cycles;
     __shared__ unsigned long long sm_clock_begin;
 
     int q_head = (int)blockIdx.x;
@@ -1228,6 +1377,16 @@ __global__ void decode_attention_cache_flash_decode_kernel(
             sm_block_switches = 0;
             sm_oob_skips = 0;
             sm_tiles_processed = 0;
+            sm_map_cycles = 0;
+            sm_qk_cycles = 0;
+            sm_qk_load_cycles = 0;
+            sm_qk_fma_cycles = 0;
+            sm_qk_reduce_cycles = 0;
+            sm_softmax_cycles = 0;
+            sm_value_cycles = 0;
+            sm_value_load_cycles = 0;
+            sm_value_fma_cycles = 0;
+            sm_merge_cycles = 0;
             sm_clock_begin = clock64();
         }
     }
@@ -1238,11 +1397,6 @@ __global__ void decode_attention_cache_flash_decode_kernel(
     const __nv_bfloat16* q_vec = q + q_head * HEAD_DIM;
     __nv_bfloat16* out_vec = out + q_head * HEAD_DIM;
     float q_local[kElemsPerLane];
-    #pragma unroll
-    for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
-        q_local[i] = __bfloat162float(q_vec[d]);
-    }
 
     float m = -INFINITY;
     float s = 0.0f;
@@ -1250,14 +1404,25 @@ __global__ void decode_attention_cache_flash_decode_kernel(
 
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * HEAD_DIM;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * HEAD_DIM;
-    const __nv_fp8_e4m3* k_base_fp8 = kv_fp8_enabled ? (k_cache_fp8 + kv_head * max_seq_len * HEAD_DIM) : nullptr;
-    const __nv_fp8_e4m3* v_base_fp8 = kv_fp8_enabled ? (v_cache_fp8 + kv_head * max_seq_len * HEAD_DIM) : nullptr;
-    const float* k_scale_base = kv_fp8_enabled ? (k_scale_cache + kv_head) : nullptr;
-    const float* v_scale_base = kv_fp8_enabled ? (v_scale_cache + kv_head) : nullptr;
-    float k_scale = kv_fp8_enabled ? *k_scale_base : 1.0f;
-    float v_scale = kv_fp8_enabled ? *v_scale_base : 1.0f;
-    if (k_scale < 1.0e-8f) k_scale = 1.0f;
-    if (v_scale < 1.0e-8f) v_scale = 1.0f;
+    const __nv_fp8_e4m3* k_base_fp8 = nullptr;
+    const __nv_fp8_e4m3* v_base_fp8 = nullptr;
+    float k_scale = 1.0f;
+    float v_scale = 1.0f;
+    if constexpr (KV_FP8) {
+        k_base_fp8 = k_cache_fp8 + kv_head * max_seq_len * HEAD_DIM;
+        v_base_fp8 = v_cache_fp8 + kv_head * max_seq_len * HEAD_DIM;
+        k_scale = k_scale_cache[kv_head];
+        v_scale = v_scale_cache[kv_head];
+        if (k_scale < 1.0e-8f) k_scale = 1.0f;
+        if (v_scale < 1.0e-8f) v_scale = 1.0f;
+    }
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        int d = lane_id * kElemsPerLane + i;
+        float qv = __bfloat162float(q_vec[d]);
+        if constexpr (KV_FP8) qv *= k_scale;
+        q_local[i] = qv;
+    }
     bool paged = (kv_block_table != nullptr && kv_block_size > 0);
 
     int cached_logical_block = -1;
@@ -1266,12 +1431,24 @@ __global__ void decode_attention_cache_flash_decode_kernel(
     int local_block_switches = 0;
     int local_oob_skips = 0;
     int local_tiles = 0;
+    unsigned long long local_map_cycles = 0;
+    unsigned long long local_qk_cycles = 0;
+    unsigned long long local_qk_load_cycles = 0;
+    unsigned long long local_qk_fma_cycles = 0;
+    unsigned long long local_qk_reduce_cycles = 0;
+    unsigned long long local_softmax_cycles = 0;
+    unsigned long long local_value_cycles = 0;
+    unsigned long long local_value_load_cycles = 0;
+    unsigned long long local_value_fma_cycles = 0;
+    bool debug_lane = (debug_out != nullptr && lane_id == 0);
     for (int tile_start = warp_id * kFlashTile;
          tile_start < cache_len;
          tile_start += active_warps * kFlashTile) {
         local_tiles += 1;
         #pragma unroll
         for (int ti = 0; ti < kFlashTile; ti++) {
+            unsigned long long t_map_begin = 0;
+            if (debug_lane) t_map_begin = clock64();
             int t = tile_start + ti;
             if (t >= cache_len) break;
 
@@ -1286,6 +1463,7 @@ __global__ void decode_attention_cache_flash_decode_kernel(
                 int in_block = t - logical_block * kv_block_size;
                 physical_t = cached_physical_block * kv_block_size + in_block;
             }
+            if (debug_lane) local_map_cycles += (clock64() - t_map_begin);
             if (physical_t >= max_seq_len) {
                 local_oob_skips += 1;
                 continue;
@@ -1294,28 +1472,83 @@ __global__ void decode_attention_cache_flash_decode_kernel(
 
             const __nv_bfloat16* k_vec = k_base + physical_t * HEAD_DIM;
             const __nv_bfloat16* v_vec = v_base + physical_t * HEAD_DIM;
-            const __nv_fp8_e4m3* k_vec_fp8 = kv_fp8_enabled ? (k_base_fp8 + physical_t * HEAD_DIM) : nullptr;
-            const __nv_fp8_e4m3* v_vec_fp8 = kv_fp8_enabled ? (v_base_fp8 + physical_t * HEAD_DIM) : nullptr;
+            const __nv_fp8_e4m3* k_vec_fp8 = KV_FP8 ? (k_base_fp8 + physical_t * HEAD_DIM) : nullptr;
+            const __nv_fp8_e4m3* v_vec_fp8 = KV_FP8 ? (v_base_fp8 + physical_t * HEAD_DIM) : nullptr;
+            unsigned long long t_qk_begin = 0;
+            if (debug_lane) t_qk_begin = clock64();
             float dot = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < kElemsPerLane; i++) {
-                int d = lane_id + i * WARP_SIZE;
-                dot += q_local[i] * kv_cache_load_elem(k_vec, k_vec_fp8, d, k_scale, kv_fp8_enabled);
+            if constexpr (KV_FP8) {
+                int d0 = lane_id * kElemsPerLane;
+                unsigned long long t_load_begin = 0;
+                if (debug_lane) t_load_begin = clock64();
+                SplitFp8x4Pack kpack = split_load_fp8x4(k_vec_fp8 + d0);
+                if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                unsigned long long t_fma_begin = 0;
+                if (debug_lane) t_fma_begin = clock64();
+                dot += q_local[0] * static_cast<float>(kpack.v[0]);
+                dot += q_local[1] * static_cast<float>(kpack.v[1]);
+                dot += q_local[2] * static_cast<float>(kpack.v[2]);
+                dot += q_local[3] * static_cast<float>(kpack.v[3]);
+                if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kElemsPerLane; i++) {
+                    int d = lane_id * kElemsPerLane + i;
+                    unsigned long long t_load_begin = 0;
+                    if (debug_lane) t_load_begin = clock64();
+                    float kval = __bfloat162float(k_vec[d]);
+                    if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                    unsigned long long t_fma_begin = 0;
+                    if (debug_lane) t_fma_begin = clock64();
+                    dot += q_local[i] * kval;
+                    if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+                }
             }
+            unsigned long long t_qk_reduce_begin = 0;
+            if (debug_lane) t_qk_reduce_begin = clock64();
             dot = warp_reduce_sum(dot) * attn_scale;
             float score = __shfl_sync(0xffffffff, dot, 0);
+            if (debug_lane) local_qk_reduce_cycles += (clock64() - t_qk_reduce_begin);
+            if (debug_lane) local_qk_cycles += (clock64() - t_qk_begin);
 
+            unsigned long long t_softmax_begin = 0;
+            if (debug_lane) t_softmax_begin = clock64();
             float m_new = fmaxf(m, score);
             float old_scale = expf(m - m_new);
             float new_scale = expf(score - m_new);
             s = s * old_scale + new_scale;
+            if (debug_lane) local_softmax_cycles += (clock64() - t_softmax_begin);
 
-            #pragma unroll
-            for (int i = 0; i < kElemsPerLane; i++) {
-                int d = lane_id + i * WARP_SIZE;
-                float vv = kv_cache_load_elem(v_vec, v_vec_fp8, d, v_scale, kv_fp8_enabled);
-                out_local[i] = out_local[i] * old_scale + vv * new_scale;
+            unsigned long long t_value_begin = 0;
+            if (debug_lane) t_value_begin = clock64();
+            if constexpr (KV_FP8) {
+                int d0 = lane_id * kElemsPerLane;
+                unsigned long long t_vload_begin = 0;
+                if (debug_lane) t_vload_begin = clock64();
+                SplitFp8x4Pack vpack = split_load_fp8x4(v_vec_fp8 + d0);
+                if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                unsigned long long t_vfma_begin = 0;
+                if (debug_lane) t_vfma_begin = clock64();
+                out_local[0] = out_local[0] * old_scale + static_cast<float>(vpack.v[0]) * new_scale;
+                out_local[1] = out_local[1] * old_scale + static_cast<float>(vpack.v[1]) * new_scale;
+                out_local[2] = out_local[2] * old_scale + static_cast<float>(vpack.v[2]) * new_scale;
+                out_local[3] = out_local[3] * old_scale + static_cast<float>(vpack.v[3]) * new_scale;
+                if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kElemsPerLane; i++) {
+                    int d = lane_id * kElemsPerLane + i;
+                    unsigned long long t_vload_begin = 0;
+                    if (debug_lane) t_vload_begin = clock64();
+                    float vv = __bfloat162float(v_vec[d]);
+                    if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                    unsigned long long t_vfma_begin = 0;
+                    if (debug_lane) t_vfma_begin = clock64();
+                    out_local[i] = out_local[i] * old_scale + vv * new_scale;
+                    if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
+                }
             }
+            if (debug_lane) local_value_cycles += (clock64() - t_value_begin);
             m = m_new;
         }
     }
@@ -1325,6 +1558,15 @@ __global__ void decode_attention_cache_flash_decode_kernel(
         atomicAdd(&sm_block_switches, local_block_switches);
         atomicAdd(&sm_oob_skips, local_oob_skips);
         atomicAdd(&sm_tiles_processed, local_tiles);
+        atomicAdd(&sm_map_cycles, local_map_cycles);
+        atomicAdd(&sm_qk_cycles, local_qk_cycles);
+        atomicAdd(&sm_qk_load_cycles, local_qk_load_cycles);
+        atomicAdd(&sm_qk_fma_cycles, local_qk_fma_cycles);
+        atomicAdd(&sm_qk_reduce_cycles, local_qk_reduce_cycles);
+        atomicAdd(&sm_softmax_cycles, local_softmax_cycles);
+        atomicAdd(&sm_value_cycles, local_value_cycles);
+        atomicAdd(&sm_value_load_cycles, local_value_load_cycles);
+        atomicAdd(&sm_value_fma_cycles, local_value_fma_cycles);
     }
 
     if (lane_id == 0) {
@@ -1333,12 +1575,14 @@ __global__ void decode_attention_cache_flash_decode_kernel(
     }
     #pragma unroll
     for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
+        int d = lane_id * kElemsPerLane + i;
         sm_out[warp_id * HEAD_DIM + d] = out_local[i];
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
+        unsigned long long merge_begin = 0;
+        if (debug_out != nullptr) merge_begin = clock64();
         float g_m = -INFINITY;
         for (int w = 0; w < active_warps; w++) g_m = fmaxf(g_m, sm_m[w]);
         float g_s = 0.0f;
@@ -1348,18 +1592,21 @@ __global__ void decode_attention_cache_flash_decode_kernel(
             g_s += sm_s[w] * scale;
         }
         sm_global_s = g_s;
+        if (debug_out != nullptr) sm_merge_cycles += (clock64() - merge_begin);
     }
     __syncthreads();
 
     float inv_s = (sm_global_s > 0.0f) ? (1.0f / sm_global_s) : 0.0f;
     #pragma unroll
     for (int i = 0; i < kElemsPerLane; i++) {
-        int d = lane_id + i * WARP_SIZE;
+        int d = lane_id * kElemsPerLane + i;
         float acc = 0.0f;
         for (int w = 0; w < active_warps; w++) {
             acc += sm_out[w * HEAD_DIM + d] * sm_scale[w];
         }
-        out_vec[d] = __float2bfloat16(acc * inv_s);
+        float out_f = acc * inv_s;
+        if constexpr (KV_FP8) out_f *= v_scale;
+        out_vec[d] = __float2bfloat16(out_f);
     }
 
     if (debug_out != nullptr && threadIdx.x == 0) {
@@ -1371,6 +1618,16 @@ __global__ void decode_attention_cache_flash_decode_kernel(
         rec.block_switches = sm_block_switches;
         rec.oob_skips = sm_oob_skips;
         rec.tiles_processed = sm_tiles_processed;
+        rec.map_cycles = sm_map_cycles;
+        rec.qk_cycles = sm_qk_cycles;
+        rec.qk_load_cycles = sm_qk_load_cycles;
+        rec.qk_fma_cycles = sm_qk_fma_cycles;
+        rec.qk_reduce_cycles = sm_qk_reduce_cycles;
+        rec.softmax_cycles = sm_softmax_cycles;
+        rec.value_cycles = sm_value_cycles;
+        rec.value_load_cycles = sm_value_load_cycles;
+        rec.value_fma_cycles = sm_value_fma_cycles;
+        rec.merge_cycles = sm_merge_cycles;
         debug_out[q_head] = rec;
     }
 }
