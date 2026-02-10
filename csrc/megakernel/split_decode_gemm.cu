@@ -817,6 +817,10 @@ struct SplitFlashDecodeDebugRec {
     unsigned long long value_cycles;
     unsigned long long value_load_cycles;
     unsigned long long value_fma_cycles;
+    unsigned long long value_dequant_cycles;
+    unsigned long long value_rescale_cycles;
+    unsigned long long value_accum_cycles;
+    unsigned long long value_bookkeep_cycles;
     unsigned long long merge_cycles;
     int cache_len;
     int active_warps;
@@ -1268,6 +1272,10 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
     __shared__ unsigned long long sm_value_cycles;
     __shared__ unsigned long long sm_value_load_cycles;
     __shared__ unsigned long long sm_value_fma_cycles;
+    __shared__ unsigned long long sm_value_dequant_cycles;
+    __shared__ unsigned long long sm_value_rescale_cycles;
+    __shared__ unsigned long long sm_value_accum_cycles;
+    __shared__ unsigned long long sm_value_bookkeep_cycles;
     __shared__ unsigned long long sm_merge_cycles;
     __shared__ unsigned long long sm_clock_begin;
     __shared__ __half sm_q_tc0[HEAD_DIM];
@@ -1342,6 +1350,10 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
             sm_value_cycles = 0;
             sm_value_load_cycles = 0;
             sm_value_fma_cycles = 0;
+            sm_value_dequant_cycles = 0;
+            sm_value_rescale_cycles = 0;
+            sm_value_accum_cycles = 0;
+            sm_value_bookkeep_cycles = 0;
             sm_merge_cycles = 0;
             sm_clock_begin = clock64();
         }
@@ -1425,6 +1437,10 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
         unsigned long long local_value_cycles = 0;
         unsigned long long local_value_load_cycles = 0;
         unsigned long long local_value_fma_cycles = 0;
+        unsigned long long local_value_dequant_cycles = 0;
+        unsigned long long local_value_rescale_cycles = 0;
+        unsigned long long local_value_accum_cycles = 0;
+        unsigned long long local_value_bookkeep_cycles = 0;
         bool debug_lane = (ENABLE_DEBUG && lane_id == 0);
         int block_size = (use_blocking ? kv_block_size : max_seq_len);
         if (block_size <= 0) block_size = max_seq_len;
@@ -1558,6 +1574,21 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         }
                     }
                     if (debug_lane) local_qk_tc_unpack_cycles += (clock64() - t_tc_unpack_begin);
+                    int d0 = lane_id * kElemsPerLane;
+                    SplitFp8x4Pack vpack_prefetch[kFlashTile];
+                    unsigned long long t_vprefetch_begin = 0;
+                    if (debug_lane) t_vprefetch_begin = clock64();
+                    #pragma unroll
+                    for (int ti = 0; ti < kFlashTile; ti++) {
+                        if ((valid_mask & (1u << ti)) == 0) {
+                            vpack_prefetch[ti].raw = 0u;
+                            continue;
+                        }
+                        int physical_t = physical_tile[ti];
+                        const __nv_fp8_e4m3* v_vec_fp8 = v_base_fp8 + physical_t * head_dim;
+                        vpack_prefetch[ti] = split_load_fp8x4(v_vec_fp8 + d0);
+                    }
+                    if (debug_lane) local_value_load_cycles += (clock64() - t_vprefetch_begin);
                     unsigned long long t_qk_reduce_begin = 0;
                     if (debug_lane) t_qk_reduce_begin = clock64();
                     #pragma unroll
@@ -1581,33 +1612,49 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         s1 = s1 * old_scale1 + new_scale1;
                         if (debug_lane) local_softmax_cycles += (clock64() - t_softmax_begin);
 
-                        int physical_t = physical_tile[ti];
-                        const __nv_fp8_e4m3* v_vec_fp8 = v_base_fp8 + physical_t * head_dim;
                         unsigned long long t_value_begin = 0;
                         if (debug_lane) t_value_begin = clock64();
-                        int d0 = lane_id * kElemsPerLane;
-                        unsigned long long t_vload_begin = 0;
-                        if (debug_lane) t_vload_begin = clock64();
-                        SplitFp8x4Pack vpack = split_load_fp8x4(v_vec_fp8 + d0);
-                        if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                        const SplitFp8x4Pack& vpack = vpack_prefetch[ti];
                         unsigned long long t_vfma_begin = 0;
                         if (debug_lane) t_vfma_begin = clock64();
+                        unsigned long long t_vdeq_begin = 0;
+                        if (debug_lane) t_vdeq_begin = clock64();
                         float v0 = static_cast<float>(vpack.v[0]);
                         float v1 = static_cast<float>(vpack.v[1]);
                         float v2 = static_cast<float>(vpack.v[2]);
                         float v3 = static_cast<float>(vpack.v[3]);
-                        out_local0[0] = out_local0[0] * old_scale0 + v0 * new_scale0;
-                        out_local0[1] = out_local0[1] * old_scale0 + v1 * new_scale0;
-                        out_local0[2] = out_local0[2] * old_scale0 + v2 * new_scale0;
-                        out_local0[3] = out_local0[3] * old_scale0 + v3 * new_scale0;
-                        out_local1[0] = out_local1[0] * old_scale1 + v0 * new_scale1;
-                        out_local1[1] = out_local1[1] * old_scale1 + v1 * new_scale1;
-                        out_local1[2] = out_local1[2] * old_scale1 + v2 * new_scale1;
-                        out_local1[3] = out_local1[3] * old_scale1 + v3 * new_scale1;
+                        if (debug_lane) local_value_dequant_cycles += (clock64() - t_vdeq_begin);
+
+                        unsigned long long t_vrescale_begin = 0;
+                        if (debug_lane) t_vrescale_begin = clock64();
+                        float out0_old0 = out_local0[0] * old_scale0;
+                        float out0_old1 = out_local0[1] * old_scale0;
+                        float out0_old2 = out_local0[2] * old_scale0;
+                        float out0_old3 = out_local0[3] * old_scale0;
+                        float out1_old0 = out_local1[0] * old_scale1;
+                        float out1_old1 = out_local1[1] * old_scale1;
+                        float out1_old2 = out_local1[2] * old_scale1;
+                        float out1_old3 = out_local1[3] * old_scale1;
+                        if (debug_lane) local_value_rescale_cycles += (clock64() - t_vrescale_begin);
+
+                        unsigned long long t_vaccum_begin = 0;
+                        if (debug_lane) t_vaccum_begin = clock64();
+                        out_local0[0] = fmaf(v0, new_scale0, out0_old0);
+                        out_local0[1] = fmaf(v1, new_scale0, out0_old1);
+                        out_local0[2] = fmaf(v2, new_scale0, out0_old2);
+                        out_local0[3] = fmaf(v3, new_scale0, out0_old3);
+                        out_local1[0] = fmaf(v0, new_scale1, out1_old0);
+                        out_local1[1] = fmaf(v1, new_scale1, out1_old1);
+                        out_local1[2] = fmaf(v2, new_scale1, out1_old2);
+                        out_local1[3] = fmaf(v3, new_scale1, out1_old3);
+                        if (debug_lane) local_value_accum_cycles += (clock64() - t_vaccum_begin);
                         if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
                         if (debug_lane) local_value_cycles += (clock64() - t_value_begin);
+                        unsigned long long t_vbook_begin = 0;
+                        if (debug_lane) t_vbook_begin = clock64();
                         m0 = m_new0;
                         m1 = m_new1;
+                        if (debug_lane) local_value_bookkeep_cycles += (clock64() - t_vbook_begin);
                     }
                     if (debug_lane) local_qk_reduce_cycles += (clock64() - t_qk_reduce_begin);
                     if (debug_lane) local_qk_cycles += (clock64() - t_qk_begin);
@@ -1633,6 +1680,14 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
                         const __nv_fp8_e4m3* k_vec_fp8 = KV_FP8 ? (k_base_fp8 + physical_t * head_dim) : nullptr;
                         const __nv_fp8_e4m3* v_vec_fp8 = KV_FP8 ? (v_base_fp8 + physical_t * head_dim) : nullptr;
+                        SplitFp8x4Pack vpack_prefetch{};
+                        if constexpr (KV_FP8) {
+                            int d0 = lane_id * kElemsPerLane;
+                            unsigned long long t_vload_begin = 0;
+                            if (debug_lane) t_vload_begin = clock64();
+                            vpack_prefetch = split_load_fp8x4(v_vec_fp8 + d0);
+                            if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                        }
 
                         unsigned long long t_qk_begin = 0;
                         if (debug_lane) t_qk_begin = clock64();
@@ -1705,25 +1760,40 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         unsigned long long t_value_begin = 0;
                         if (debug_lane) t_value_begin = clock64();
                         if constexpr (KV_FP8) {
-                            int d0 = lane_id * kElemsPerLane;
-                            unsigned long long t_vload_begin = 0;
-                            if (debug_lane) t_vload_begin = clock64();
-                            SplitFp8x4Pack vpack = split_load_fp8x4(v_vec_fp8 + d0);
-                            if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
+                            const SplitFp8x4Pack& vpack = vpack_prefetch;
                             unsigned long long t_vfma_begin = 0;
                             if (debug_lane) t_vfma_begin = clock64();
+                            unsigned long long t_vdeq_begin = 0;
+                            if (debug_lane) t_vdeq_begin = clock64();
                             float v0 = static_cast<float>(vpack.v[0]);
                             float v1 = static_cast<float>(vpack.v[1]);
                             float v2 = static_cast<float>(vpack.v[2]);
                             float v3 = static_cast<float>(vpack.v[3]);
-                            out_local0[0] = out_local0[0] * old_scale0 + v0 * new_scale0;
-                            out_local0[1] = out_local0[1] * old_scale0 + v1 * new_scale0;
-                            out_local0[2] = out_local0[2] * old_scale0 + v2 * new_scale0;
-                            out_local0[3] = out_local0[3] * old_scale0 + v3 * new_scale0;
-                            out_local1[0] = out_local1[0] * old_scale1 + v0 * new_scale1;
-                            out_local1[1] = out_local1[1] * old_scale1 + v1 * new_scale1;
-                            out_local1[2] = out_local1[2] * old_scale1 + v2 * new_scale1;
-                            out_local1[3] = out_local1[3] * old_scale1 + v3 * new_scale1;
+                            if (debug_lane) local_value_dequant_cycles += (clock64() - t_vdeq_begin);
+
+                            unsigned long long t_vrescale_begin = 0;
+                            if (debug_lane) t_vrescale_begin = clock64();
+                            float out0_old0 = out_local0[0] * old_scale0;
+                            float out0_old1 = out_local0[1] * old_scale0;
+                            float out0_old2 = out_local0[2] * old_scale0;
+                            float out0_old3 = out_local0[3] * old_scale0;
+                            float out1_old0 = out_local1[0] * old_scale1;
+                            float out1_old1 = out_local1[1] * old_scale1;
+                            float out1_old2 = out_local1[2] * old_scale1;
+                            float out1_old3 = out_local1[3] * old_scale1;
+                            if (debug_lane) local_value_rescale_cycles += (clock64() - t_vrescale_begin);
+
+                            unsigned long long t_vaccum_begin = 0;
+                            if (debug_lane) t_vaccum_begin = clock64();
+                            out_local0[0] = fmaf(v0, new_scale0, out0_old0);
+                            out_local0[1] = fmaf(v1, new_scale0, out0_old1);
+                            out_local0[2] = fmaf(v2, new_scale0, out0_old2);
+                            out_local0[3] = fmaf(v3, new_scale0, out0_old3);
+                            out_local1[0] = fmaf(v0, new_scale1, out1_old0);
+                            out_local1[1] = fmaf(v1, new_scale1, out1_old1);
+                            out_local1[2] = fmaf(v2, new_scale1, out1_old2);
+                            out_local1[3] = fmaf(v3, new_scale1, out1_old3);
+                            if (debug_lane) local_value_accum_cycles += (clock64() - t_vaccum_begin);
                             if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
                         } else {
                             #pragma unroll
@@ -1735,14 +1805,28 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                                 if (debug_lane) local_value_load_cycles += (clock64() - t_vload_begin);
                                 unsigned long long t_vfma_begin = 0;
                                 if (debug_lane) t_vfma_begin = clock64();
-                                out_local0[i] = out_local0[i] * old_scale0 + vv * new_scale0;
-                                out_local1[i] = out_local1[i] * old_scale1 + vv * new_scale1;
+                                unsigned long long t_vdeq_begin = 0;
+                                if (debug_lane) t_vdeq_begin = clock64();
+                                if (debug_lane) local_value_dequant_cycles += (clock64() - t_vdeq_begin);
+                                unsigned long long t_vrescale_begin = 0;
+                                if (debug_lane) t_vrescale_begin = clock64();
+                                float out0_old = out_local0[i] * old_scale0;
+                                float out1_old = out_local1[i] * old_scale1;
+                                if (debug_lane) local_value_rescale_cycles += (clock64() - t_vrescale_begin);
+                                unsigned long long t_vaccum_begin = 0;
+                                if (debug_lane) t_vaccum_begin = clock64();
+                                out_local0[i] = fmaf(vv, new_scale0, out0_old);
+                                out_local1[i] = fmaf(vv, new_scale1, out1_old);
+                                if (debug_lane) local_value_accum_cycles += (clock64() - t_vaccum_begin);
                                 if (debug_lane) local_value_fma_cycles += (clock64() - t_vfma_begin);
                             }
                         }
                         if (debug_lane) local_value_cycles += (clock64() - t_value_begin);
+                        unsigned long long t_vbook_begin = 0;
+                        if (debug_lane) t_vbook_begin = clock64();
                         m0 = m_new0;
                         m1 = m_new1;
+                        if (debug_lane) local_value_bookkeep_cycles += (clock64() - t_vbook_begin);
                     }
                 }
             }
@@ -1765,6 +1849,10 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
             atomicAdd(&sm_value_cycles, local_value_cycles);
             atomicAdd(&sm_value_load_cycles, local_value_load_cycles);
             atomicAdd(&sm_value_fma_cycles, local_value_fma_cycles);
+            atomicAdd(&sm_value_dequant_cycles, local_value_dequant_cycles);
+            atomicAdd(&sm_value_rescale_cycles, local_value_rescale_cycles);
+            atomicAdd(&sm_value_accum_cycles, local_value_accum_cycles);
+            atomicAdd(&sm_value_bookkeep_cycles, local_value_bookkeep_cycles);
             }
         }
     }
@@ -1858,6 +1946,10 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
             rec.value_cycles = sm_value_cycles;
             rec.value_load_cycles = sm_value_load_cycles;
             rec.value_fma_cycles = sm_value_fma_cycles;
+            rec.value_dequant_cycles = sm_value_dequant_cycles;
+            rec.value_rescale_cycles = sm_value_rescale_cycles;
+            rec.value_accum_cycles = sm_value_accum_cycles;
+            rec.value_bookkeep_cycles = sm_value_bookkeep_cycles;
             rec.merge_cycles = sm_merge_cycles;
             debug_out[idx0] = rec;
             debug_out[idx1] = rec;

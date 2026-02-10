@@ -915,6 +915,10 @@ extern "C" void launch_split_decode_gemm(
                     unsigned long long sum_value_cycles = 0;
                     unsigned long long sum_value_load_cycles = 0;
                     unsigned long long sum_value_fma_cycles = 0;
+                    unsigned long long sum_value_dequant_cycles = 0;
+                    unsigned long long sum_value_rescale_cycles = 0;
+                    unsigned long long sum_value_accum_cycles = 0;
+                    unsigned long long sum_value_bookkeep_cycles = 0;
                     unsigned long long sum_merge_cycles = 0;
                     int cache_len_from_rec = cache_len_dbg;
                     int warps_from_rec = attn_warps;
@@ -945,6 +949,10 @@ extern "C" void launch_split_decode_gemm(
                                     sum_value_cycles += rec.value_cycles;
                                     sum_value_load_cycles += rec.value_load_cycles;
                                     sum_value_fma_cycles += rec.value_fma_cycles;
+                                    sum_value_dequant_cycles += rec.value_dequant_cycles;
+                                    sum_value_rescale_cycles += rec.value_rescale_cycles;
+                                    sum_value_accum_cycles += rec.value_accum_cycles;
+                                    sum_value_bookkeep_cycles += rec.value_bookkeep_cycles;
                                     sum_merge_cycles += rec.merge_cycles;
                                     if (p == 0 && c == 0 && h == 0) {
                                         cache_len_from_rec = rec.cache_len;
@@ -1019,6 +1027,12 @@ extern "C" void launch_split_decode_gemm(
                             (unsigned long long)sum_qk_reduce_cycles, to_ms(sum_qk_reduce_cycles), 100.0 * (double)sum_qk_reduce_cycles / denom_overlap,
                             (unsigned long long)sum_value_load_cycles, to_ms(sum_value_load_cycles), 100.0 * (double)sum_value_load_cycles / denom_overlap,
                             (unsigned long long)sum_value_fma_cycles, to_ms(sum_value_fma_cycles), 100.0 * (double)sum_value_fma_cycles / denom_overlap);
+                        std::printf(
+                            "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_value_fine (phase12): value_dequant=%llu/%.3fms ov=%.1f%% value_rescale=%llu/%.3fms ov=%.1f%% value_accum=%llu/%.3fms ov=%.1f%% value_bookkeep=%llu/%.3fms ov=%.1f%%\n",
+                            (unsigned long long)sum_value_dequant_cycles, to_ms(sum_value_dequant_cycles), 100.0 * (double)sum_value_dequant_cycles / denom_overlap,
+                            (unsigned long long)sum_value_rescale_cycles, to_ms(sum_value_rescale_cycles), 100.0 * (double)sum_value_rescale_cycles / denom_overlap,
+                            (unsigned long long)sum_value_accum_cycles, to_ms(sum_value_accum_cycles), 100.0 * (double)sum_value_accum_cycles / denom_overlap,
+                            (unsigned long long)sum_value_bookkeep_cycles, to_ms(sum_value_bookkeep_cycles), 100.0 * (double)sum_value_bookkeep_cycles / denom_overlap);
                         std::printf(
                             "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_tc (phase12): qk_tc_pack=%llu/%.3fms ov=%.1f%% qk_tc_mma=%llu/%.3fms ov=%.1f%% qk_tc_unpack=%llu/%.3fms ov=%.1f%%\n",
                             (unsigned long long)sum_qk_tc_pack_cycles, to_ms(sum_qk_tc_pack_cycles), 100.0 * (double)sum_qk_tc_pack_cycles / denom_overlap,
@@ -1132,6 +1146,10 @@ extern "C" void launch_split_decode_gemm(
                     unsigned long long sum_value_cycles = 0;
                     unsigned long long sum_value_load_cycles = 0;
                     unsigned long long sum_value_fma_cycles = 0;
+                    unsigned long long sum_value_dequant_cycles = 0;
+                    unsigned long long sum_value_rescale_cycles = 0;
+                    unsigned long long sum_value_accum_cycles = 0;
+                    unsigned long long sum_value_bookkeep_cycles = 0;
                     unsigned long long sum_merge_cycles = 0;
                     int cache_len_dbg = 0;
                     int active_warps_dbg = 0;
@@ -1153,6 +1171,10 @@ extern "C" void launch_split_decode_gemm(
                         sum_value_cycles += flash_debug_host[h].value_cycles;
                         sum_value_load_cycles += flash_debug_host[h].value_load_cycles;
                         sum_value_fma_cycles += flash_debug_host[h].value_fma_cycles;
+                        sum_value_dequant_cycles += flash_debug_host[h].value_dequant_cycles;
+                        sum_value_rescale_cycles += flash_debug_host[h].value_rescale_cycles;
+                        sum_value_accum_cycles += flash_debug_host[h].value_accum_cycles;
+                        sum_value_bookkeep_cycles += flash_debug_host[h].value_bookkeep_cycles;
                         sum_merge_cycles += flash_debug_host[h].merge_cycles;
                         if (h == 0) {
                             cache_len_dbg = flash_debug_host[h].cache_len;
@@ -1208,6 +1230,12 @@ extern "C" void launch_split_decode_gemm(
                             (unsigned long long)sum_qk_reduce_cycles, to_ms(sum_qk_reduce_cycles), 100.0 * (double)sum_qk_reduce_cycles / denom_overlap,
                             (unsigned long long)sum_value_load_cycles, to_ms(sum_value_load_cycles), 100.0 * (double)sum_value_load_cycles / denom_overlap,
                             (unsigned long long)sum_value_fma_cycles, to_ms(sum_value_fma_cycles), 100.0 * (double)sum_value_fma_cycles / denom_overlap);
+                        std::printf(
+                            "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_value_fine: value_dequant=%llu/%.3fms ov=%.1f%% value_rescale=%llu/%.3fms ov=%.1f%% value_accum=%llu/%.3fms ov=%.1f%% value_bookkeep=%llu/%.3fms ov=%.1f%%\n",
+                            (unsigned long long)sum_value_dequant_cycles, to_ms(sum_value_dequant_cycles), 100.0 * (double)sum_value_dequant_cycles / denom_overlap,
+                            (unsigned long long)sum_value_rescale_cycles, to_ms(sum_value_rescale_cycles), 100.0 * (double)sum_value_rescale_cycles / denom_overlap,
+                            (unsigned long long)sum_value_accum_cycles, to_ms(sum_value_accum_cycles), 100.0 * (double)sum_value_accum_cycles / denom_overlap,
+                            (unsigned long long)sum_value_bookkeep_cycles, to_ms(sum_value_bookkeep_cycles), 100.0 * (double)sum_value_bookkeep_cycles / denom_overlap);
                         std::printf(
                             "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_tc: qk_tc_pack=%llu/%.3fms ov=%.1f%% qk_tc_mma=%llu/%.3fms ov=%.1f%% qk_tc_unpack=%llu/%.3fms ov=%.1f%%\n",
                             (unsigned long long)sum_qk_tc_pack_cycles, to_ms(sum_qk_tc_pack_cycles), 100.0 * (double)sum_qk_tc_pack_cycles / denom_overlap,
