@@ -398,6 +398,20 @@ static inline int _split_flash_attn_warps_per_head() {
     return warps;
 }
 
+static inline bool _split_flash_warps_user_override() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s_flash = std::getenv("MEGAQWEN_SPLIT_FLASH_WARPS");
+    const char* s_attn = std::getenv("MEGAQWEN_SPLIT_ATTN_WARPS");
+    if ((s_flash != nullptr && std::strcmp(s_flash, "") != 0) ||
+        (s_attn != nullptr && std::strcmp(s_attn, "") != 0)) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+    return mode == 1;
+}
+
 static inline int _split_flash_parts() {
     static int parts = -1;
     if (parts > 0) return parts;
@@ -411,6 +425,58 @@ static inline int _split_flash_parts() {
     if (v > 4) v = 4;
     parts = v;
     return parts;
+}
+
+static inline bool _split_flash_gqa_share_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_FLASH_GQA_SHARE");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "1") == 0 ||
+        std::strcmp(s, "true") == 0 ||
+        std::strcmp(s, "True") == 0) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+    return mode == 1;
+}
+
+static inline bool _split_flash_fp8_tc_qk_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_FLASH_FP8_TC_QK");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "1") == 0 ||
+        std::strcmp(s, "true") == 0 ||
+        std::strcmp(s, "True") == 0) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+    return mode == 1;
+}
+
+static inline int _split_flash_gqa_mode() {
+    // 0=tc, 1=simt_fast
+    static int mode = -1;
+    if (mode >= 0) return mode;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_FLASH_GQA_MODE");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "simt_fast") == 0 ||
+        std::strcmp(s, "simt") == 0 ||
+        std::strcmp(s, "1") == 0) {
+        mode = 1;
+    } else if (std::strcmp(s, "tc") == 0 || std::strcmp(s, "0") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode;
+}
+
+static inline const char* _split_flash_gqa_mode_name() {
+    return (_split_flash_gqa_mode() == 0) ? "tc" : "simt_fast";
 }
 
 static inline int _split_debug_budget() {
@@ -740,12 +806,15 @@ extern "C" void split_debug_stage_print_summary() {
     printf("         gemv=%5lld\n", agg.down_gemv);
     printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
            _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
-    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d flash_parts=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
+    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d flash_parts=%d flash_gqa_share=%d flash_gqa_mode=%s flash_fp8_tc_qk=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
            _split_kv_layout_paged_enabled() ? "paged" : "contiguous",
            _split_kv_block_size(),
            _split_kv_fp8_enabled() ? 1 : 0,
            _split_kv_fp8_only_enabled() ? 1 : 0,
            _split_flash_parts(),
+           _split_flash_gqa_share_enabled() ? 1 : 0,
+           _split_flash_gqa_mode_name(),
+           _split_flash_fp8_tc_qk_enabled() ? 1 : 0,
            _split_qkv_w4_enabled() ? 1 : 0,
            agg.qkv_w4,
            _split_o_w4_enabled() ? 1 : 0,
