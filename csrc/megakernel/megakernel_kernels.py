@@ -19,6 +19,15 @@ VOCAB_SIZE = 151936
 
 
 def _cuda_arch_flag(default: str = "-arch=sm_86") -> str:
+    arch_env = os.environ.get("MEGAQWEN_CUDA_ARCH", "").strip()
+    if arch_env:
+        if arch_env.startswith("-arch="):
+            return arch_env
+        if arch_env.startswith("sm_"):
+            return f"-arch={arch_env}"
+        digits = arch_env.replace(".", "")
+        if digits.isdigit():
+            return f"-arch=sm_{digits}"
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         return f"-arch=sm_{major}{minor}"
@@ -139,4 +148,3 @@ def _compile_fused_prefill_kernel():
         verbose=verbose,
     )
     return _fused_prefill_kernel
-

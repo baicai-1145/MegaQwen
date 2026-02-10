@@ -135,7 +135,13 @@ extern "C" void launch_split_decode_gemm(
         }
         kv_fp8_enabled = 0;
     }
+    int k_fp8_enabled = (kv_fp8_enabled && _split_k_fp8_enabled()) ? 1 : 0;
     int kv_fp8_only = (kv_fp8_enabled && _split_kv_fp8_only_enabled()) ? 1 : 0;
+    if (!k_fp8_enabled) kv_fp8_only = 0;
+    const char* kv_mode_desc =
+        kv_fp8_enabled
+            ? (k_fp8_enabled ? "fp8_spec" : "kbf16_vfp8")
+            : "bf16_spec";
 
     bool debug_paged_kv = _split_debug_paged_kv_take_ticket();
     bool debug_flash_decode = _split_debug_flash_decode_take_ticket();
@@ -551,7 +557,9 @@ extern "C" void launch_split_decode_gemm(
                 constexpr size_t kFlashGqaTcSharedBytes = size_t(8) * size_t(16) * size_t(16) *
                                                           size_t(2 + 2 + 4);
                 size_t flash_gqa_tc_shared_bytes =
-                    (use_gqa_phase1 && !use_gqa_simt_fast && kv_fp8_enabled && flash_fp8_tc_qk) ? kFlashGqaTcSharedBytes : 0;
+                    (use_gqa_phase1 && !use_gqa_simt_fast && kv_fp8_enabled && k_fp8_enabled && flash_fp8_tc_qk)
+                        ? kFlashGqaTcSharedBytes
+                        : 0;
                 SplitFlashDecodeDebugRec* gqa_phase_debug_ptr =
                     (debug_flash_decode && use_gqa_phase1 && flash_phase_debug_dev != nullptr &&
                      flash_phase_debug_cap >= (NUM_Q_HEADS * split_attn_max_chunks * parts))
@@ -559,9 +567,43 @@ extern "C" void launch_split_decode_gemm(
                         : nullptr;
                 if (kv_fp8_enabled) {
                     if (use_gqa_phase1) {
-                        if (use_gqa_simt_fast) {
+                        if (use_gqa_simt_fast || !k_fp8_enabled) {
                             if (gqa_phase_debug_ptr != nullptr) {
-                                decode_attention_cache_flash_phase1_gqa2_kernel_t<true, false, true><<<blocks, threads, 0, stream>>>(
+                                if (k_fp8_enabled) {
+                                    decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, false, true><<<blocks, threads, 0, stream>>>(
+                                        (const __nv_bfloat16*)q_proj_bf16,
+                                        (const __nv_bfloat16*)layer_k_cache,
+                                        (const __nv_bfloat16*)layer_v_cache,
+                                        (const __nv_fp8_e4m3*)layer_k_cache_fp8,
+                                        (const __nv_fp8_e4m3*)layer_v_cache_fp8,
+                                        (const float*)layer_k_scale_cache,
+                                        (const float*)layer_v_scale_cache,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_m_dev
+                                            : (float*)split_attn_partial_m,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_s_dev
+                                            : (float*)split_attn_partial_s,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_out_dev
+                                            : (float*)split_attn_partial_out,
+                                        NUM_Q_HEADS,
+                                        NUM_KV_HEADS,
+                                        HEAD_DIM,
+                                        max_seq_len,
+                                        attn_scale,
+                                        attn_warps,
+                                        parts,
+                                        split_attn_chunk_size,
+                                        split_attn_max_chunks,
+                                        kv_block_table_attn,
+                                        kv_block_size,
+                                        position_ptr,
+                                        0,
+                                        gqa_phase_debug_ptr
+                                    );
+                                } else {
+                                    decode_attention_cache_flash_phase1_gqa2_kernel_t<false, true, false, true><<<blocks, threads, 0, stream>>>(
                                     (const __nv_bfloat16*)q_proj_bf16,
                                     (const __nv_bfloat16*)layer_k_cache,
                                     (const __nv_bfloat16*)layer_v_cache,
@@ -593,43 +635,79 @@ extern "C" void launch_split_decode_gemm(
                                     0,
                                     gqa_phase_debug_ptr
                                 );
+                                }
                             } else {
-                                decode_attention_cache_flash_phase1_gqa2_kernel_t<true, false, false><<<blocks, threads, 0, stream>>>(
-                                (const __nv_bfloat16*)q_proj_bf16,
-                                (const __nv_bfloat16*)layer_k_cache,
-                                (const __nv_bfloat16*)layer_v_cache,
-                                (const __nv_fp8_e4m3*)layer_k_cache_fp8,
-                                (const __nv_fp8_e4m3*)layer_v_cache_fp8,
-                                (const float*)layer_k_scale_cache,
-                                (const float*)layer_v_scale_cache,
-                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
-                                    ? (float*)flash_part_m_dev
-                                    : (float*)split_attn_partial_m,
-                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
-                                    ? (float*)flash_part_s_dev
-                                    : (float*)split_attn_partial_s,
-                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
-                                    ? (float*)flash_part_out_dev
-                                    : (float*)split_attn_partial_out,
-                                NUM_Q_HEADS,
-                                NUM_KV_HEADS,
-                                HEAD_DIM,
-                                max_seq_len,
-                                attn_scale,
-                                attn_warps,
-                                parts,
-                                split_attn_chunk_size,
-                                split_attn_max_chunks,
-                                kv_block_table_attn,
-                                kv_block_size,
-                                position_ptr,
-                                0,
-                                nullptr
-                            );
+                                if (k_fp8_enabled) {
+                                    decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, false, false><<<blocks, threads, 0, stream>>>(
+                                        (const __nv_bfloat16*)q_proj_bf16,
+                                        (const __nv_bfloat16*)layer_k_cache,
+                                        (const __nv_bfloat16*)layer_v_cache,
+                                        (const __nv_fp8_e4m3*)layer_k_cache_fp8,
+                                        (const __nv_fp8_e4m3*)layer_v_cache_fp8,
+                                        (const float*)layer_k_scale_cache,
+                                        (const float*)layer_v_scale_cache,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_m_dev
+                                            : (float*)split_attn_partial_m,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_s_dev
+                                            : (float*)split_attn_partial_s,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_out_dev
+                                            : (float*)split_attn_partial_out,
+                                        NUM_Q_HEADS,
+                                        NUM_KV_HEADS,
+                                        HEAD_DIM,
+                                        max_seq_len,
+                                        attn_scale,
+                                        attn_warps,
+                                        parts,
+                                        split_attn_chunk_size,
+                                        split_attn_max_chunks,
+                                        kv_block_table_attn,
+                                        kv_block_size,
+                                        position_ptr,
+                                        0,
+                                        nullptr
+                                    );
+                                } else {
+                                    decode_attention_cache_flash_phase1_gqa2_kernel_t<false, true, false, false><<<blocks, threads, 0, stream>>>(
+                                        (const __nv_bfloat16*)q_proj_bf16,
+                                        (const __nv_bfloat16*)layer_k_cache,
+                                        (const __nv_bfloat16*)layer_v_cache,
+                                        (const __nv_fp8_e4m3*)layer_k_cache_fp8,
+                                        (const __nv_fp8_e4m3*)layer_v_cache_fp8,
+                                        (const float*)layer_k_scale_cache,
+                                        (const float*)layer_v_scale_cache,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_m_dev
+                                            : (float*)split_attn_partial_m,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_s_dev
+                                            : (float*)split_attn_partial_s,
+                                        (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                            ? (float*)flash_part_out_dev
+                                            : (float*)split_attn_partial_out,
+                                        NUM_Q_HEADS,
+                                        NUM_KV_HEADS,
+                                        HEAD_DIM,
+                                        max_seq_len,
+                                        attn_scale,
+                                        attn_warps,
+                                        parts,
+                                        split_attn_chunk_size,
+                                        split_attn_max_chunks,
+                                        kv_block_table_attn,
+                                        kv_block_size,
+                                        position_ptr,
+                                        0,
+                                        nullptr
+                                    );
+                                }
                             }
                         } else {
                             if (gqa_phase_debug_ptr != nullptr) {
-                                decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, true><<<blocks, threads, flash_gqa_tc_shared_bytes, stream>>>(
+                                decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, true, true><<<blocks, threads, flash_gqa_tc_shared_bytes, stream>>>(
                                 (const __nv_bfloat16*)q_proj_bf16,
                                 (const __nv_bfloat16*)layer_k_cache,
                                 (const __nv_bfloat16*)layer_v_cache,
@@ -662,7 +740,7 @@ extern "C" void launch_split_decode_gemm(
                                 gqa_phase_debug_ptr
                             );
                             } else {
-                                decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, false><<<blocks, threads, flash_gqa_tc_shared_bytes, stream>>>(
+                                decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, true, false><<<blocks, threads, flash_gqa_tc_shared_bytes, stream>>>(
                             (const __nv_bfloat16*)q_proj_bf16,
                             (const __nv_bfloat16*)layer_k_cache,
                             (const __nv_bfloat16*)layer_v_cache,
@@ -697,45 +775,82 @@ extern "C" void launch_split_decode_gemm(
                             }
                         }
                     } else {
-                        decode_attention_cache_flash_phase1_kernel_t<true><<<blocks, threads, 0, stream>>>(
-                            (const __nv_bfloat16*)q_proj_bf16,
-                            (const __nv_bfloat16*)layer_k_cache,
-                            (const __nv_bfloat16*)layer_v_cache,
-                            (const __nv_fp8_e4m3*)layer_k_cache_fp8,
-                            (const __nv_fp8_e4m3*)layer_v_cache_fp8,
-                            (const float*)layer_k_scale_cache,
-                            (const float*)layer_v_scale_cache,
-                            (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
-                                ? (float*)flash_part_m_dev
-                                : (float*)split_attn_partial_m,
-                            (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
-                                ? (float*)flash_part_s_dev
-                                : (float*)split_attn_partial_s,
-                            (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
-                                ? (float*)flash_part_out_dev
-                                : (float*)split_attn_partial_out,
-                            NUM_Q_HEADS,
-                            NUM_KV_HEADS,
-                            HEAD_DIM,
-                            max_seq_len,
-                            attn_scale,
-                            attn_warps,
-                            parts,
-                            split_attn_chunk_size,
-                            split_attn_max_chunks,
-                            kv_block_table_attn,
-                            kv_block_size,
-                            position_ptr,
-                            (debug_flash_decode && flash_phase_debug_dev != nullptr &&
-                             flash_phase_debug_cap >= blocks)
-                                ? flash_phase_debug_dev
-                                : nullptr
-                        );
+                        if (k_fp8_enabled) {
+                            decode_attention_cache_flash_phase1_kernel_t<true><<<blocks, threads, 0, stream>>>(
+                                (const __nv_bfloat16*)q_proj_bf16,
+                                (const __nv_bfloat16*)layer_k_cache,
+                                (const __nv_bfloat16*)layer_v_cache,
+                                (const __nv_fp8_e4m3*)layer_k_cache_fp8,
+                                (const __nv_fp8_e4m3*)layer_v_cache_fp8,
+                                (const float*)layer_k_scale_cache,
+                                (const float*)layer_v_scale_cache,
+                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                    ? (float*)flash_part_m_dev
+                                    : (float*)split_attn_partial_m,
+                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                    ? (float*)flash_part_s_dev
+                                    : (float*)split_attn_partial_s,
+                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                    ? (float*)flash_part_out_dev
+                                    : (float*)split_attn_partial_out,
+                                NUM_Q_HEADS,
+                                NUM_KV_HEADS,
+                                HEAD_DIM,
+                                max_seq_len,
+                                attn_scale,
+                                attn_warps,
+                                parts,
+                                split_attn_chunk_size,
+                                split_attn_max_chunks,
+                                kv_block_table_attn,
+                                kv_block_size,
+                                position_ptr,
+                                (debug_flash_decode && flash_phase_debug_dev != nullptr &&
+                                 flash_phase_debug_cap >= blocks)
+                                    ? flash_phase_debug_dev
+                                    : nullptr
+                            );
+                        } else {
+                            decode_attention_cache_flash_phase1_kernel_t<false><<<blocks, threads, 0, stream>>>(
+                                (const __nv_bfloat16*)q_proj_bf16,
+                                (const __nv_bfloat16*)layer_k_cache,
+                                (const __nv_bfloat16*)layer_v_cache,
+                                (const __nv_fp8_e4m3*)layer_k_cache_fp8,
+                                (const __nv_fp8_e4m3*)layer_v_cache_fp8,
+                                (const float*)layer_k_scale_cache,
+                                (const float*)layer_v_scale_cache,
+                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                    ? (float*)flash_part_m_dev
+                                    : (float*)split_attn_partial_m,
+                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                    ? (float*)flash_part_s_dev
+                                    : (float*)split_attn_partial_s,
+                                (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr)
+                                    ? (float*)flash_part_out_dev
+                                    : (float*)split_attn_partial_out,
+                                NUM_Q_HEADS,
+                                NUM_KV_HEADS,
+                                HEAD_DIM,
+                                max_seq_len,
+                                attn_scale,
+                                attn_warps,
+                                parts,
+                                split_attn_chunk_size,
+                                split_attn_max_chunks,
+                                kv_block_table_attn,
+                                kv_block_size,
+                                position_ptr,
+                                (debug_flash_decode && flash_phase_debug_dev != nullptr &&
+                                 flash_phase_debug_cap >= blocks)
+                                    ? flash_phase_debug_dev
+                                    : nullptr
+                            );
+                        }
                     }
                 } else {
                     if (use_gqa_phase1) {
                         if (gqa_phase_debug_ptr != nullptr) {
-                            decode_attention_cache_flash_phase1_gqa2_kernel_t<false, false, true><<<blocks, threads, 0, stream>>>(
+                            decode_attention_cache_flash_phase1_gqa2_kernel_t<false, false, false, true><<<blocks, threads, 0, stream>>>(
                                 (const __nv_bfloat16*)q_proj_bf16,
                                 (const __nv_bfloat16*)layer_k_cache,
                                 (const __nv_bfloat16*)layer_v_cache,
@@ -768,7 +883,7 @@ extern "C" void launch_split_decode_gemm(
                                 gqa_phase_debug_ptr
                             );
                         } else {
-                            decode_attention_cache_flash_phase1_gqa2_kernel_t<false, false, false><<<blocks, threads, 0, stream>>>(
+                            decode_attention_cache_flash_phase1_gqa2_kernel_t<false, false, false, false><<<blocks, threads, 0, stream>>>(
                             (const __nv_bfloat16*)q_proj_bf16,
                             (const __nv_bfloat16*)layer_k_cache,
                             (const __nv_bfloat16*)layer_v_cache,
@@ -906,7 +1021,11 @@ extern "C" void launch_split_decode_gemm(
                     unsigned long long sum_map_cycles = 0;
                     unsigned long long sum_qk_cycles = 0;
                     unsigned long long sum_qk_load_cycles = 0;
+                    unsigned long long sum_qk_load_mem_cycles = 0;
+                    unsigned long long sum_qk_load_cvt_cycles = 0;
+                    unsigned long long sum_qk_load_bf16_cycles = 0;
                     unsigned long long sum_qk_fma_cycles = 0;
+                    unsigned long long sum_qk_fma_bf16_cycles = 0;
                     unsigned long long sum_qk_reduce_cycles = 0;
                     unsigned long long sum_qk_tc_pack_cycles = 0;
                     unsigned long long sum_qk_tc_mma_cycles = 0;
@@ -940,7 +1059,11 @@ extern "C" void launch_split_decode_gemm(
                                     sum_map_cycles += rec.map_cycles;
                                     sum_qk_cycles += rec.qk_cycles;
                                     sum_qk_load_cycles += rec.qk_load_cycles;
+                                    sum_qk_load_mem_cycles += rec.qk_load_mem_cycles;
+                                    sum_qk_load_cvt_cycles += rec.qk_load_cvt_cycles;
+                                    sum_qk_load_bf16_cycles += rec.qk_load_bf16_cycles;
                                     sum_qk_fma_cycles += rec.qk_fma_cycles;
+                                    sum_qk_fma_bf16_cycles += rec.qk_fma_bf16_cycles;
                                     sum_qk_reduce_cycles += rec.qk_reduce_cycles;
                                     sum_qk_tc_pack_cycles += rec.qk_tc_pack_cycles;
                                     sum_qk_tc_mma_cycles += rec.qk_tc_mma_cycles;
@@ -963,14 +1086,15 @@ extern "C" void launch_split_decode_gemm(
                         }
                     }
 
+                    bool gqa_mode_simt_effective = (use_gqa_simt_fast || !k_fp8_enabled);
                     int flash_fp8_tc_qk_effective =
-                        (kv_fp8_enabled && use_gqa_phase1 && !use_gqa_simt_fast && flash_fp8_tc_qk) ? 1 : 0;
+                        (kv_fp8_enabled && use_gqa_phase1 && !gqa_mode_simt_effective && flash_fp8_tc_qk) ? 1 : 0;
                     double avg_cycles = (used_blocks > 0) ? (double(sum_cycles) / double(used_blocks)) : 0.0;
                     std::printf(
                         "[MEGAQWEN_DEBUG] FLASH_DECODE layer=%02d token_pos=%d mode=phase12 kv_mode=%s cache_len=%d warps=%d chunk=%d chunks=%d parts=%d blocks=%d launched=%d gqa_share=%d gqa_mode=%s tc_qk=%d tc_qk_eff=%d avg_cycles=%.1f tokens=%lld block_switches=%lld oob=%lld tiles=%lld\n",
                         layer,
                         debug_position_host,
-                        kv_fp8_enabled ? "fp8_spec" : "bf16_spec",
+                        kv_mode_desc,
                         cache_len_from_rec,
                         warps_from_rec,
                         split_attn_chunk_size,
@@ -979,7 +1103,7 @@ extern "C" void launch_split_decode_gemm(
                         used_blocks,
                         launched_blocks,
                         use_gqa_phase1 ? 1 : 0,
-                        use_gqa_simt_fast ? "simt_fast" : "tc",
+                        gqa_mode_simt_effective ? "simt_fast" : "tc",
                         flash_fp8_tc_qk,
                         flash_fp8_tc_qk_effective,
                         avg_cycles,
@@ -1027,6 +1151,16 @@ extern "C" void launch_split_decode_gemm(
                             (unsigned long long)sum_qk_reduce_cycles, to_ms(sum_qk_reduce_cycles), 100.0 * (double)sum_qk_reduce_cycles / denom_overlap,
                             (unsigned long long)sum_value_load_cycles, to_ms(sum_value_load_cycles), 100.0 * (double)sum_value_load_cycles / denom_overlap,
                             (unsigned long long)sum_value_fma_cycles, to_ms(sum_value_fma_cycles), 100.0 * (double)sum_value_fma_cycles / denom_overlap);
+                        double denom_qk_load = (sum_qk_load_cycles > 0) ? (double)sum_qk_load_cycles : 1.0;
+                        std::printf(
+                            "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_qk_load_fine (phase12): qk_load_mem=%llu/%.3fms ov=%.1f%% qk_load_cvt=%llu/%.3fms ov=%.1f%% qk_load_bf16=%llu/%.3fms ov=%.1f%% mem_ratio=%.1f%% cvt_ratio=%.1f%% bf16_ratio=%.1f%% qk_fma_bf16=%llu/%.3fms ov=%.1f%%\n",
+                            (unsigned long long)sum_qk_load_mem_cycles, to_ms(sum_qk_load_mem_cycles), 100.0 * (double)sum_qk_load_mem_cycles / denom_overlap,
+                            (unsigned long long)sum_qk_load_cvt_cycles, to_ms(sum_qk_load_cvt_cycles), 100.0 * (double)sum_qk_load_cvt_cycles / denom_overlap,
+                            (unsigned long long)sum_qk_load_bf16_cycles, to_ms(sum_qk_load_bf16_cycles), 100.0 * (double)sum_qk_load_bf16_cycles / denom_overlap,
+                            100.0 * (double)sum_qk_load_mem_cycles / denom_qk_load,
+                            100.0 * (double)sum_qk_load_cvt_cycles / denom_qk_load,
+                            100.0 * (double)sum_qk_load_bf16_cycles / denom_qk_load,
+                            (unsigned long long)sum_qk_fma_bf16_cycles, to_ms(sum_qk_fma_bf16_cycles), 100.0 * (double)sum_qk_fma_bf16_cycles / denom_overlap);
                         std::printf(
                             "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_value_fine (phase12): value_dequant=%llu/%.3fms ov=%.1f%% value_rescale=%llu/%.3fms ov=%.1f%% value_accum=%llu/%.3fms ov=%.1f%% value_bookkeep=%llu/%.3fms ov=%.1f%%\n",
                             (unsigned long long)sum_value_dequant_cycles, to_ms(sum_value_dequant_cycles), 100.0 * (double)sum_value_dequant_cycles / denom_overlap,
@@ -1146,7 +1280,11 @@ extern "C" void launch_split_decode_gemm(
                     unsigned long long sum_map_cycles = 0;
                     unsigned long long sum_qk_cycles = 0;
                     unsigned long long sum_qk_load_cycles = 0;
+                    unsigned long long sum_qk_load_mem_cycles = 0;
+                    unsigned long long sum_qk_load_cvt_cycles = 0;
+                    unsigned long long sum_qk_load_bf16_cycles = 0;
                     unsigned long long sum_qk_fma_cycles = 0;
+                    unsigned long long sum_qk_fma_bf16_cycles = 0;
                     unsigned long long sum_qk_reduce_cycles = 0;
                     unsigned long long sum_qk_tc_pack_cycles = 0;
                     unsigned long long sum_qk_tc_mma_cycles = 0;
@@ -1171,7 +1309,11 @@ extern "C" void launch_split_decode_gemm(
                         sum_map_cycles += flash_debug_host[h].map_cycles;
                         sum_qk_cycles += flash_debug_host[h].qk_cycles;
                         sum_qk_load_cycles += flash_debug_host[h].qk_load_cycles;
+                        sum_qk_load_mem_cycles += flash_debug_host[h].qk_load_mem_cycles;
+                        sum_qk_load_cvt_cycles += flash_debug_host[h].qk_load_cvt_cycles;
+                        sum_qk_load_bf16_cycles += flash_debug_host[h].qk_load_bf16_cycles;
                         sum_qk_fma_cycles += flash_debug_host[h].qk_fma_cycles;
+                        sum_qk_fma_bf16_cycles += flash_debug_host[h].qk_fma_bf16_cycles;
                         sum_qk_reduce_cycles += flash_debug_host[h].qk_reduce_cycles;
                         sum_qk_tc_pack_cycles += flash_debug_host[h].qk_tc_pack_cycles;
                         sum_qk_tc_mma_cycles += flash_debug_host[h].qk_tc_mma_cycles;
@@ -1195,7 +1337,7 @@ extern "C" void launch_split_decode_gemm(
                         "[MEGAQWEN_DEBUG] FLASH_DECODE layer=%02d token_pos=%d mode=single kv_mode=%s cache_len=%d warps=%d avg_cycles=%.1f tokens=%lld block_switches=%lld oob=%lld tiles=%lld\n",
                         layer,
                         debug_position_host,
-                        kv_fp8_enabled ? "fp8_spec" : "bf16_spec",
+                        kv_mode_desc,
                         cache_len_dbg,
                         active_warps_dbg,
                         avg_cycles,
@@ -1239,6 +1381,16 @@ extern "C" void launch_split_decode_gemm(
                             (unsigned long long)sum_qk_reduce_cycles, to_ms(sum_qk_reduce_cycles), 100.0 * (double)sum_qk_reduce_cycles / denom_overlap,
                             (unsigned long long)sum_value_load_cycles, to_ms(sum_value_load_cycles), 100.0 * (double)sum_value_load_cycles / denom_overlap,
                             (unsigned long long)sum_value_fma_cycles, to_ms(sum_value_fma_cycles), 100.0 * (double)sum_value_fma_cycles / denom_overlap);
+                        double denom_qk_load = (sum_qk_load_cycles > 0) ? (double)sum_qk_load_cycles : 1.0;
+                        std::printf(
+                            "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_qk_load_fine: qk_load_mem=%llu/%.3fms ov=%.1f%% qk_load_cvt=%llu/%.3fms ov=%.1f%% qk_load_bf16=%llu/%.3fms ov=%.1f%% mem_ratio=%.1f%% cvt_ratio=%.1f%% bf16_ratio=%.1f%% qk_fma_bf16=%llu/%.3fms ov=%.1f%%\n",
+                            (unsigned long long)sum_qk_load_mem_cycles, to_ms(sum_qk_load_mem_cycles), 100.0 * (double)sum_qk_load_mem_cycles / denom_overlap,
+                            (unsigned long long)sum_qk_load_cvt_cycles, to_ms(sum_qk_load_cvt_cycles), 100.0 * (double)sum_qk_load_cvt_cycles / denom_overlap,
+                            (unsigned long long)sum_qk_load_bf16_cycles, to_ms(sum_qk_load_bf16_cycles), 100.0 * (double)sum_qk_load_bf16_cycles / denom_overlap,
+                            100.0 * (double)sum_qk_load_mem_cycles / denom_qk_load,
+                            100.0 * (double)sum_qk_load_cvt_cycles / denom_qk_load,
+                            100.0 * (double)sum_qk_load_bf16_cycles / denom_qk_load,
+                            (unsigned long long)sum_qk_fma_bf16_cycles, to_ms(sum_qk_fma_bf16_cycles), 100.0 * (double)sum_qk_fma_bf16_cycles / denom_overlap);
                         std::printf(
                             "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_value_fine: value_dequant=%llu/%.3fms ov=%.1f%% value_rescale=%llu/%.3fms ov=%.1f%% value_accum=%llu/%.3fms ov=%.1f%% value_bookkeep=%llu/%.3fms ov=%.1f%%\n",
                             (unsigned long long)sum_value_dequant_cycles, to_ms(sum_value_dequant_cycles), 100.0 * (double)sum_value_dequant_cycles / denom_overlap,

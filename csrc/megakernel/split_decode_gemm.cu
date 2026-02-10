@@ -109,12 +109,36 @@ union SplitFp8x4Pack {
     __nv_fp8_e4m3 v[4];
 };
 
+struct SplitHalf2x2Pack {
+    __half2 h01;
+    __half2 h23;
+};
+
 __device__ __forceinline__ SplitFp8x4Pack split_load_fp8x4(
     const __nv_fp8_e4m3* __restrict__ ptr
 ) {
     SplitFp8x4Pack pack;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
+    pack.raw = __ldg(reinterpret_cast<const uint32_t*>(ptr));
+#else
     pack.raw = *reinterpret_cast<const uint32_t*>(ptr);
+#endif
     return pack;
+}
+
+__device__ __forceinline__ SplitHalf2x2Pack split_fp8x4_to_half2x2(
+    const SplitFp8x4Pack& pack
+) {
+    SplitHalf2x2Pack out;
+    __half2_raw raw01 = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<uint16_t>(pack.raw),
+        __NV_E4M3);
+    __half2_raw raw23 = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<uint16_t>(pack.raw >> 16U),
+        __NV_E4M3);
+    out.h01 = __halves2half2(__ushort_as_half(raw01.x), __ushort_as_half(raw01.y));
+    out.h23 = __halves2half2(__ushort_as_half(raw23.x), __ushort_as_half(raw23.y));
+    return out;
 }
 
 // Quantize existing BF16 KV cache into FP8 cache for [start_pos, end_pos).
@@ -808,7 +832,11 @@ struct SplitFlashDecodeDebugRec {
     unsigned long long map_cycles;
     unsigned long long qk_cycles;
     unsigned long long qk_load_cycles;
+    unsigned long long qk_load_mem_cycles;
+    unsigned long long qk_load_cvt_cycles;
+    unsigned long long qk_load_bf16_cycles;
     unsigned long long qk_fma_cycles;
+    unsigned long long qk_fma_bf16_cycles;
     unsigned long long qk_reduce_cycles;
     unsigned long long qk_tc_pack_cycles;
     unsigned long long qk_tc_mma_cycles;
@@ -877,7 +905,9 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
     __shared__ unsigned long long sm_map_cycles;
     __shared__ unsigned long long sm_qk_cycles;
     __shared__ unsigned long long sm_qk_load_cycles;
+    __shared__ unsigned long long sm_qk_load_bf16_cycles;
     __shared__ unsigned long long sm_qk_fma_cycles;
+    __shared__ unsigned long long sm_qk_fma_bf16_cycles;
     __shared__ unsigned long long sm_qk_reduce_cycles;
     __shared__ unsigned long long sm_softmax_cycles;
     __shared__ unsigned long long sm_value_cycles;
@@ -932,7 +962,9 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
             sm_map_cycles = 0;
             sm_qk_cycles = 0;
             sm_qk_load_cycles = 0;
+            sm_qk_load_bf16_cycles = 0;
             sm_qk_fma_cycles = 0;
+            sm_qk_fma_bf16_cycles = 0;
             sm_qk_reduce_cycles = 0;
             sm_softmax_cycles = 0;
             sm_value_cycles = 0;
@@ -989,7 +1021,9 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
         unsigned long long local_map_cycles = 0;
         unsigned long long local_qk_cycles = 0;
         unsigned long long local_qk_load_cycles = 0;
+        unsigned long long local_qk_load_bf16_cycles = 0;
         unsigned long long local_qk_fma_cycles = 0;
+        unsigned long long local_qk_fma_bf16_cycles = 0;
         unsigned long long local_qk_reduce_cycles = 0;
         unsigned long long local_softmax_cycles = 0;
         unsigned long long local_value_cycles = 0;
@@ -1065,11 +1099,19 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
                             unsigned long long t_load_begin = 0;
                             if (debug_lane) t_load_begin = clock64();
                             float kval = __bfloat162float(k_vec[d]);
-                            if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                            if (debug_lane) {
+                                unsigned long long bf16_load = (clock64() - t_load_begin);
+                                local_qk_load_cycles += bf16_load;
+                                local_qk_load_bf16_cycles += bf16_load;
+                            }
                             unsigned long long t_fma_begin = 0;
                             if (debug_lane) t_fma_begin = clock64();
                             dot += q_local[i] * kval;
-                            if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+                            if (debug_lane) {
+                                unsigned long long bf16_fma = (clock64() - t_fma_begin);
+                                local_qk_fma_cycles += bf16_fma;
+                                local_qk_fma_bf16_cycles += bf16_fma;
+                            }
                         }
                     }
                     unsigned long long t_qk_reduce_begin = 0;
@@ -1129,7 +1171,9 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
             atomicAdd(&sm_map_cycles, local_map_cycles);
             atomicAdd(&sm_qk_cycles, local_qk_cycles);
             atomicAdd(&sm_qk_load_cycles, local_qk_load_cycles);
+            atomicAdd(&sm_qk_load_bf16_cycles, local_qk_load_bf16_cycles);
             atomicAdd(&sm_qk_fma_cycles, local_qk_fma_cycles);
+            atomicAdd(&sm_qk_fma_bf16_cycles, local_qk_fma_bf16_cycles);
             atomicAdd(&sm_qk_reduce_cycles, local_qk_reduce_cycles);
             atomicAdd(&sm_softmax_cycles, local_softmax_cycles);
             atomicAdd(&sm_value_cycles, local_value_cycles);
@@ -1193,7 +1237,9 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
             rec.map_cycles = sm_map_cycles;
             rec.qk_cycles = sm_qk_cycles;
             rec.qk_load_cycles = sm_qk_load_cycles;
+            rec.qk_load_bf16_cycles = sm_qk_load_bf16_cycles;
             rec.qk_fma_cycles = sm_qk_fma_cycles;
+            rec.qk_fma_bf16_cycles = sm_qk_fma_bf16_cycles;
             rec.qk_reduce_cycles = sm_qk_reduce_cycles;
             rec.softmax_cycles = sm_softmax_cycles;
             rec.value_cycles = sm_value_cycles;
@@ -1208,7 +1254,7 @@ __global__ void decode_attention_cache_flash_phase1_kernel_t(
 // Flash-decode v2 phase-1 (GQA shared-KV variant):
 // - One block handles one (kv_head, chunk), and computes two q_heads sharing the same KV head.
 // - This reuses FP8 K/V loads and dequant conversion across grouped q heads (Q/KV ratio = 2).
-template <bool KV_FP8, bool ENABLE_TC_QK, bool ENABLE_DEBUG>
+template <bool K_FP8, bool V_FP8, bool ENABLE_TC_QK, bool ENABLE_DEBUG>
 __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
     const __nv_bfloat16* __restrict__ q,             // [num_q_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,       // [num_kv_heads, max_seq_len, head_dim]
@@ -1263,7 +1309,11 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
     __shared__ unsigned long long sm_map_cycles;
     __shared__ unsigned long long sm_qk_cycles;
     __shared__ unsigned long long sm_qk_load_cycles;
+    __shared__ unsigned long long sm_qk_load_mem_cycles;
+    __shared__ unsigned long long sm_qk_load_cvt_cycles;
+    __shared__ unsigned long long sm_qk_load_bf16_cycles;
     __shared__ unsigned long long sm_qk_fma_cycles;
+    __shared__ unsigned long long sm_qk_fma_bf16_cycles;
     __shared__ unsigned long long sm_qk_reduce_cycles;
     __shared__ unsigned long long sm_qk_tc_pack_cycles;
     __shared__ unsigned long long sm_qk_tc_mma_cycles;
@@ -1292,7 +1342,7 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
     if (num_q_heads <= 0 || num_kv_heads <= 0) return;
     if (partitions_per_chunk <= 0) return;
     if (num_q_heads != 2 * num_kv_heads) return;
-    bool use_fp8_tc_qk = (ENABLE_TC_QK && KV_FP8 && fp8_tc_qk != 0);
+    bool use_fp8_tc_qk = (ENABLE_TC_QK && K_FP8 && fp8_tc_qk != 0);
 
     int block_linear = (int)blockIdx.x;
     int kv_head = block_linear % num_kv_heads;
@@ -1341,7 +1391,11 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
             sm_map_cycles = 0;
             sm_qk_cycles = 0;
             sm_qk_load_cycles = 0;
+            sm_qk_load_mem_cycles = 0;
+            sm_qk_load_cvt_cycles = 0;
+            sm_qk_load_bf16_cycles = 0;
             sm_qk_fma_cycles = 0;
+            sm_qk_fma_bf16_cycles = 0;
             sm_qk_reduce_cycles = 0;
             sm_qk_tc_pack_cycles = 0;
             sm_qk_tc_mma_cycles = 0;
@@ -1381,12 +1435,14 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
     const __nv_fp8_e4m3* v_base_fp8 = nullptr;
     float k_scale = 1.0f;
     float v_scale = 1.0f;
-    if constexpr (KV_FP8) {
+    if constexpr (K_FP8) {
         k_base_fp8 = k_cache_fp8 + kv_head * max_seq_len * head_dim;
-        v_base_fp8 = v_cache_fp8 + kv_head * max_seq_len * head_dim;
         k_scale = k_scale_cache[kv_head];
-        v_scale = v_scale_cache[kv_head];
         if (k_scale < 1.0e-8f) k_scale = 1.0f;
+    }
+    if constexpr (V_FP8) {
+        v_base_fp8 = v_cache_fp8 + kv_head * max_seq_len * head_dim;
+        v_scale = v_scale_cache[kv_head];
         if (v_scale < 1.0e-8f) v_scale = 1.0f;
     }
     #pragma unroll
@@ -1394,7 +1450,7 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
         int d = lane_id * kElemsPerLane + i;
         float qv0 = __bfloat162float(q_vec0[d]);
         float qv1 = __bfloat162float(q_vec1[d]);
-        if constexpr (KV_FP8) {
+        if constexpr (K_FP8) {
             qv0 *= k_scale;
             qv1 *= k_scale;
         }
@@ -1428,7 +1484,11 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
         unsigned long long local_map_cycles = 0;
         unsigned long long local_qk_cycles = 0;
         unsigned long long local_qk_load_cycles = 0;
+        unsigned long long local_qk_load_mem_cycles = 0;
+        unsigned long long local_qk_load_cvt_cycles = 0;
+        unsigned long long local_qk_load_bf16_cycles = 0;
         unsigned long long local_qk_fma_cycles = 0;
+        unsigned long long local_qk_fma_bf16_cycles = 0;
         unsigned long long local_qk_reduce_cycles = 0;
         unsigned long long local_qk_tc_pack_cycles = 0;
         unsigned long long local_qk_tc_mma_cycles = 0;
@@ -1518,8 +1578,13 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                     int lane_pack_r4 = 0;
                     __half* lane_b_ptr = nullptr;
                     const __nv_fp8_e4m3* lane_k_ptr_base = nullptr;
-                    __half2 lane_h01 = __float2half2_rn(0.0f);
-                    __half2 lane_h23 = __float2half2_rn(0.0f);
+                    __half2 lane_h01_cache[kTcSteps];
+                    __half2 lane_h23_cache[kTcSteps];
+                    #pragma unroll
+                    for (int kk = 0; kk < kTcSteps; kk++) {
+                        lane_h01_cache[kk] = __float2half2_rn(0.0f);
+                        lane_h23_cache[kk] = __float2half2_rn(0.0f);
+                    }
                     if (lane_pack_active) {
                         lane_pack_c = lane_pack / kTcColsPerLane;   // 0..kFlashTile-1
                         lane_pack_r4 = (lane_pack % kTcColsPerLane) * kTcVec;  // 0/4/8/12
@@ -1527,23 +1592,33 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         int physical_t = physical_tile[lane_pack_c];
                         if (physical_t >= 0) {
                             lane_k_ptr_base = k_base_fp8 + physical_t * head_dim + lane_pack_r4;
-                            unsigned long long t_kload_begin = 0;
-                            if (debug_lane) t_kload_begin = clock64();
-                            SplitFp8x4Pack kpack = split_load_fp8x4(lane_k_ptr_base);
-                            lane_h01 = __halves2half2(
-                                static_cast<__half>(kpack.v[0]),
-                                static_cast<__half>(kpack.v[1]));
-                            lane_h23 = __halves2half2(
-                                static_cast<__half>(kpack.v[2]),
-                                static_cast<__half>(kpack.v[3]));
-                            if (debug_lane) {
-                                unsigned long long kload = (clock64() - t_kload_begin);
-                                local_qk_load_cycles += kload;
-                                local_qk_cycles += kload;
+                            #pragma unroll
+                            for (int kk = 0; kk < kTcSteps; kk++) {
+                                unsigned long long t_kmem_begin = 0;
+                                if (debug_lane) t_kmem_begin = clock64();
+                                SplitFp8x4Pack kpack = split_load_fp8x4(lane_k_ptr_base + kk * kTcK);
+                                if (debug_lane) {
+                                    unsigned long long kmem = (clock64() - t_kmem_begin);
+                                    local_qk_load_mem_cycles += kmem;
+                                    local_qk_load_cycles += kmem;
+                                    local_qk_cycles += kmem;
+                                }
+                                unsigned long long t_kcvt_begin = 0;
+                                if (debug_lane) t_kcvt_begin = clock64();
+                                SplitHalf2x2Pack kh2 = split_fp8x4_to_half2x2(kpack);
+                                lane_h01_cache[kk] = kh2.h01;
+                                lane_h23_cache[kk] = kh2.h23;
+                                if (debug_lane) {
+                                    unsigned long long kcvt = (clock64() - t_kcvt_begin);
+                                    local_qk_load_cvt_cycles += kcvt;
+                                    local_qk_load_cycles += kcvt;
+                                    local_qk_cycles += kcvt;
+                                }
                             }
                         }
                     }
 
+                    #pragma unroll
                     for (int kk = 0; kk < kTcSteps; kk++) {
                         unsigned long long t_tc_pack_begin = 0;
                         if (debug_lane) t_tc_pack_begin = clock64();
@@ -1553,8 +1628,8 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                             sm_tc_a[warp_a_base + kTcK + c] = sm_q_tc1[kk_offset + c];
                         }
                         if (lane_pack_active) {
-                            *reinterpret_cast<__half2*>(lane_b_ptr) = lane_h01;
-                            *reinterpret_cast<__half2*>(lane_b_ptr + 2) = lane_h23;
+                            *reinterpret_cast<__half2*>(lane_b_ptr) = lane_h01_cache[kk];
+                            *reinterpret_cast<__half2*>(lane_b_ptr + 2) = lane_h23_cache[kk];
                         }
                         if (debug_lane) {
                             unsigned long long tc_pack_total = (clock64() - t_tc_pack_begin);
@@ -1568,22 +1643,6 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcM, kTcN, kTcK, __half, nvcuda::wmma::col_major> b_frag;
                         nvcuda::wmma::load_matrix_sync(a_frag, sm_tc_a + warp_a_base, kTcK);
                         nvcuda::wmma::load_matrix_sync(b_frag, sm_tc_b + warp_b_base, kTcK);
-                        if (kk + 1 < kTcSteps && lane_k_ptr_base != nullptr) {
-                            unsigned long long t_kload_begin = 0;
-                            if (debug_lane) t_kload_begin = clock64();
-                            SplitFp8x4Pack kpack_next = split_load_fp8x4(lane_k_ptr_base + (kk + 1) * kTcK);
-                            lane_h01 = __halves2half2(
-                                static_cast<__half>(kpack_next.v[0]),
-                                static_cast<__half>(kpack_next.v[1]));
-                            lane_h23 = __halves2half2(
-                                static_cast<__half>(kpack_next.v[2]),
-                                static_cast<__half>(kpack_next.v[3]));
-                            if (debug_lane) {
-                                unsigned long long kload = (clock64() - t_kload_begin);
-                                local_qk_load_cycles += kload;
-                                local_qk_cycles += kload;
-                            }
-                        }
                         nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
                         if (debug_lane) {
                             unsigned long long tc_mma = (clock64() - t_tc_mma_begin);
@@ -1716,10 +1775,10 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
 
                         const __nv_bfloat16* k_vec = k_base + physical_t * head_dim;
                         const __nv_bfloat16* v_vec = v_base + physical_t * head_dim;
-                        const __nv_fp8_e4m3* k_vec_fp8 = KV_FP8 ? (k_base_fp8 + physical_t * head_dim) : nullptr;
-                        const __nv_fp8_e4m3* v_vec_fp8 = KV_FP8 ? (v_base_fp8 + physical_t * head_dim) : nullptr;
+                        const __nv_fp8_e4m3* k_vec_fp8 = K_FP8 ? (k_base_fp8 + physical_t * head_dim) : nullptr;
+                        const __nv_fp8_e4m3* v_vec_fp8 = V_FP8 ? (v_base_fp8 + physical_t * head_dim) : nullptr;
                         SplitFp8x4Pack vpack_prefetch{};
-                        if constexpr (KV_FP8) {
+                        if constexpr (V_FP8) {
                             int d0 = lane_id * kElemsPerLane;
                             unsigned long long t_vload_begin = 0;
                             if (debug_lane) t_vload_begin = clock64();
@@ -1731,20 +1790,28 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         if (debug_lane) t_qk_begin = clock64();
                         float dot0 = 0.0f;
                         float dot1 = 0.0f;
-                        if constexpr (KV_FP8) {
+                        if constexpr (K_FP8) {
                             int d0 = lane_id * kElemsPerLane;
                             unsigned long long t_load_begin = 0;
                             if (debug_lane) t_load_begin = clock64();
                             SplitFp8x4Pack kpack = split_load_fp8x4(k_vec_fp8 + d0);
-                            if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                            if (debug_lane) {
+                                unsigned long long kmem = (clock64() - t_load_begin);
+                                local_qk_load_mem_cycles += kmem;
+                                local_qk_load_cycles += kmem;
+                            }
+                            unsigned long long t_cvt_begin = 0;
+                            if (debug_lane) t_cvt_begin = clock64();
+                            SplitHalf2x2Pack kh2 = split_fp8x4_to_half2x2(kpack);
+                            if (debug_lane) {
+                                unsigned long long kcvt = (clock64() - t_cvt_begin);
+                                local_qk_load_cvt_cycles += kcvt;
+                                local_qk_load_cycles += kcvt;
+                            }
                             unsigned long long t_fma_begin = 0;
                             if (debug_lane) t_fma_begin = clock64();
-                            __half2 k01 = __halves2half2(
-                                static_cast<__half>(kpack.v[0]),
-                                static_cast<__half>(kpack.v[1]));
-                            __half2 k23 = __halves2half2(
-                                static_cast<__half>(kpack.v[2]),
-                                static_cast<__half>(kpack.v[3]));
+                            __half2 k01 = kh2.h01;
+                            __half2 k23 = kh2.h23;
                             __half2 p001 = __hmul2(q_local0_h2[0], k01);
                             __half2 p023 = __hmul2(q_local0_h2[1], k23);
                             dot0 += __half2float(__low2half(p001)) + __half2float(__high2half(p001));
@@ -1761,12 +1828,20 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                                 unsigned long long t_load_begin = 0;
                                 if (debug_lane) t_load_begin = clock64();
                                 float kval = __bfloat162float(k_vec[d]);
-                                if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                                if (debug_lane) {
+                                    unsigned long long bf16_load = (clock64() - t_load_begin);
+                                    local_qk_load_cycles += bf16_load;
+                                    local_qk_load_bf16_cycles += bf16_load;
+                                }
                                 unsigned long long t_fma_begin = 0;
                                 if (debug_lane) t_fma_begin = clock64();
                                 dot0 += q_local0[i] * kval;
                                 dot1 += q_local1[i] * kval;
-                                if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+                                if (debug_lane) {
+                                    unsigned long long bf16_fma = (clock64() - t_fma_begin);
+                                    local_qk_fma_cycles += bf16_fma;
+                                    local_qk_fma_bf16_cycles += bf16_fma;
+                                }
                             }
                         }
                         unsigned long long t_qk_reduce_begin = 0;
@@ -1797,7 +1872,7 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
 
                         unsigned long long t_value_begin = 0;
                         if (debug_lane) t_value_begin = clock64();
-                        if constexpr (KV_FP8) {
+                        if constexpr (V_FP8) {
                             const SplitFp8x4Pack& vpack = vpack_prefetch;
                             unsigned long long t_vfma_begin = 0;
                             if (debug_lane) t_vfma_begin = clock64();
@@ -1878,7 +1953,11 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
             atomicAdd(&sm_map_cycles, local_map_cycles);
             atomicAdd(&sm_qk_cycles, local_qk_cycles);
             atomicAdd(&sm_qk_load_cycles, local_qk_load_cycles);
+            atomicAdd(&sm_qk_load_mem_cycles, local_qk_load_mem_cycles);
+            atomicAdd(&sm_qk_load_cvt_cycles, local_qk_load_cvt_cycles);
+            atomicAdd(&sm_qk_load_bf16_cycles, local_qk_load_bf16_cycles);
             atomicAdd(&sm_qk_fma_cycles, local_qk_fma_cycles);
+            atomicAdd(&sm_qk_fma_bf16_cycles, local_qk_fma_bf16_cycles);
             atomicAdd(&sm_qk_reduce_cycles, local_qk_reduce_cycles);
             atomicAdd(&sm_qk_tc_pack_cycles, local_qk_tc_pack_cycles);
             atomicAdd(&sm_qk_tc_mma_cycles, local_qk_tc_mma_cycles);
@@ -1951,7 +2030,7 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                 acc1 += sm_out1[w * HEAD_DIM + d] * sm_scale1[w];
             }
         }
-        if constexpr (KV_FP8) {
+        if constexpr (V_FP8) {
             acc0 *= v_scale;
             acc1 *= v_scale;
         }
@@ -1975,7 +2054,11 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
             rec.map_cycles = sm_map_cycles;
             rec.qk_cycles = sm_qk_cycles;
             rec.qk_load_cycles = sm_qk_load_cycles;
+            rec.qk_load_mem_cycles = sm_qk_load_mem_cycles;
+            rec.qk_load_cvt_cycles = sm_qk_load_cvt_cycles;
+            rec.qk_load_bf16_cycles = sm_qk_load_bf16_cycles;
             rec.qk_fma_cycles = sm_qk_fma_cycles;
+            rec.qk_fma_bf16_cycles = sm_qk_fma_bf16_cycles;
             rec.qk_reduce_cycles = sm_qk_reduce_cycles;
             rec.qk_tc_pack_cycles = sm_qk_tc_pack_cycles;
             rec.qk_tc_mma_cycles = sm_qk_tc_mma_cycles;
@@ -2152,7 +2235,9 @@ __global__ void decode_attention_cache_flash_decode_kernel_t(
     __shared__ unsigned long long sm_map_cycles;
     __shared__ unsigned long long sm_qk_cycles;
     __shared__ unsigned long long sm_qk_load_cycles;
+    __shared__ unsigned long long sm_qk_load_bf16_cycles;
     __shared__ unsigned long long sm_qk_fma_cycles;
+    __shared__ unsigned long long sm_qk_fma_bf16_cycles;
     __shared__ unsigned long long sm_qk_reduce_cycles;
     __shared__ unsigned long long sm_softmax_cycles;
     __shared__ unsigned long long sm_value_cycles;
@@ -2191,7 +2276,9 @@ __global__ void decode_attention_cache_flash_decode_kernel_t(
             sm_map_cycles = 0;
             sm_qk_cycles = 0;
             sm_qk_load_cycles = 0;
+            sm_qk_load_bf16_cycles = 0;
             sm_qk_fma_cycles = 0;
+            sm_qk_fma_bf16_cycles = 0;
             sm_qk_reduce_cycles = 0;
             sm_softmax_cycles = 0;
             sm_value_cycles = 0;
@@ -2245,7 +2332,9 @@ __global__ void decode_attention_cache_flash_decode_kernel_t(
     unsigned long long local_map_cycles = 0;
     unsigned long long local_qk_cycles = 0;
     unsigned long long local_qk_load_cycles = 0;
+    unsigned long long local_qk_load_bf16_cycles = 0;
     unsigned long long local_qk_fma_cycles = 0;
+    unsigned long long local_qk_fma_bf16_cycles = 0;
     unsigned long long local_qk_reduce_cycles = 0;
     unsigned long long local_softmax_cycles = 0;
     unsigned long long local_value_cycles = 0;
@@ -2308,11 +2397,19 @@ __global__ void decode_attention_cache_flash_decode_kernel_t(
                     unsigned long long t_load_begin = 0;
                     if (debug_lane) t_load_begin = clock64();
                     float kval = __bfloat162float(k_vec[d]);
-                    if (debug_lane) local_qk_load_cycles += (clock64() - t_load_begin);
+                    if (debug_lane) {
+                        unsigned long long bf16_load = (clock64() - t_load_begin);
+                        local_qk_load_cycles += bf16_load;
+                        local_qk_load_bf16_cycles += bf16_load;
+                    }
                     unsigned long long t_fma_begin = 0;
                     if (debug_lane) t_fma_begin = clock64();
                     dot += q_local[i] * kval;
-                    if (debug_lane) local_qk_fma_cycles += (clock64() - t_fma_begin);
+                    if (debug_lane) {
+                        unsigned long long bf16_fma = (clock64() - t_fma_begin);
+                        local_qk_fma_cycles += bf16_fma;
+                        local_qk_fma_bf16_cycles += bf16_fma;
+                    }
                 }
             }
             unsigned long long t_qk_reduce_begin = 0;
@@ -2372,7 +2469,9 @@ __global__ void decode_attention_cache_flash_decode_kernel_t(
         atomicAdd(&sm_map_cycles, local_map_cycles);
         atomicAdd(&sm_qk_cycles, local_qk_cycles);
         atomicAdd(&sm_qk_load_cycles, local_qk_load_cycles);
+        atomicAdd(&sm_qk_load_bf16_cycles, local_qk_load_bf16_cycles);
         atomicAdd(&sm_qk_fma_cycles, local_qk_fma_cycles);
+        atomicAdd(&sm_qk_fma_bf16_cycles, local_qk_fma_bf16_cycles);
         atomicAdd(&sm_qk_reduce_cycles, local_qk_reduce_cycles);
         atomicAdd(&sm_softmax_cycles, local_softmax_cycles);
         atomicAdd(&sm_value_cycles, local_value_cycles);
@@ -2432,7 +2531,9 @@ __global__ void decode_attention_cache_flash_decode_kernel_t(
         rec.map_cycles = sm_map_cycles;
         rec.qk_cycles = sm_qk_cycles;
         rec.qk_load_cycles = sm_qk_load_cycles;
+        rec.qk_load_bf16_cycles = sm_qk_load_bf16_cycles;
         rec.qk_fma_cycles = sm_qk_fma_cycles;
+        rec.qk_fma_bf16_cycles = sm_qk_fma_bf16_cycles;
         rec.qk_reduce_cycles = sm_qk_reduce_cycles;
         rec.softmax_cycles = sm_softmax_cycles;
         rec.value_cycles = sm_value_cycles;
