@@ -1485,8 +1485,6 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                 bool full_tile = (tile_start + kFlashTile <= block_token_end);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
                 if (use_fp8_tc_qk && full_tile) {
-                    unsigned long long t_qk_begin = 0;
-                    if (debug_lane) t_qk_begin = clock64();
                     int physical_tile[kFlashTile];
                     unsigned valid_mask = 0u;
                     #pragma unroll
@@ -1509,43 +1507,60 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
 
                     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kTcM, kTcN, kTcK, float> c_frag;
                     nvcuda::wmma::fill_fragment(c_frag, 0.0f);
-                    unsigned long long t_qk_load_begin = 0;
-                    if (debug_lane) t_qk_load_begin = clock64();
-                    for (int kk = 0; kk < HEAD_DIM / kTcK; kk++) {
+                    constexpr int kTcVec = 4;
+                    constexpr int kTcColsPerLane = kTcK / kTcVec;
+                    static_assert(kFlashTile * kTcColsPerLane == WARP_SIZE,
+                                  "TC pack mapping must fully cover one tile per warp.");
+                    constexpr int kTcSteps = HEAD_DIM / kTcK;
+                    int lane_pack = lane_id;
+                    bool lane_pack_active = (lane_pack < kFlashTile * kTcColsPerLane);
+                    int lane_pack_c = 0;
+                    int lane_pack_r4 = 0;
+                    __half* lane_b_ptr = nullptr;
+                    const __nv_fp8_e4m3* lane_k_ptr_base = nullptr;
+                    __half2 lane_h01 = __float2half2_rn(0.0f);
+                    __half2 lane_h23 = __float2half2_rn(0.0f);
+                    if (lane_pack_active) {
+                        lane_pack_c = lane_pack / kTcColsPerLane;   // 0..kFlashTile-1
+                        lane_pack_r4 = (lane_pack % kTcColsPerLane) * kTcVec;  // 0/4/8/12
+                        lane_b_ptr = sm_tc_b + warp_b_base + lane_pack_c * kTcK + lane_pack_r4;
+                        int physical_t = physical_tile[lane_pack_c];
+                        if (physical_t >= 0) {
+                            lane_k_ptr_base = k_base_fp8 + physical_t * head_dim + lane_pack_r4;
+                            unsigned long long t_kload_begin = 0;
+                            if (debug_lane) t_kload_begin = clock64();
+                            SplitFp8x4Pack kpack = split_load_fp8x4(lane_k_ptr_base);
+                            lane_h01 = __halves2half2(
+                                static_cast<__half>(kpack.v[0]),
+                                static_cast<__half>(kpack.v[1]));
+                            lane_h23 = __halves2half2(
+                                static_cast<__half>(kpack.v[2]),
+                                static_cast<__half>(kpack.v[3]));
+                            if (debug_lane) {
+                                unsigned long long kload = (clock64() - t_kload_begin);
+                                local_qk_load_cycles += kload;
+                                local_qk_cycles += kload;
+                            }
+                        }
+                    }
+
+                    for (int kk = 0; kk < kTcSteps; kk++) {
                         unsigned long long t_tc_pack_begin = 0;
                         if (debug_lane) t_tc_pack_begin = clock64();
+                        int kk_offset = kk * kTcK;
                         for (int c = lane_id; c < kTcK; c += WARP_SIZE) {
-                            sm_tc_a[warp_a_base + c] = sm_q_tc0[kk * kTcK + c];
-                            sm_tc_a[warp_a_base + kTcK + c] = sm_q_tc1[kk * kTcK + c];
+                            sm_tc_a[warp_a_base + c] = sm_q_tc0[kk_offset + c];
+                            sm_tc_a[warp_a_base + kTcK + c] = sm_q_tc1[kk_offset + c];
                         }
-                        constexpr int kTcVec = 4;
-                        constexpr int kTcColsPerLane = kTcK / kTcVec;
-                        static_assert(kFlashTile * kTcColsPerLane == WARP_SIZE,
-                                      "TC pack mapping must fully cover one tile per warp.");
-                        int lane_pack = lane_id;
-                        if (lane_pack < kFlashTile * kTcColsPerLane) {
-                            int c = lane_pack / kTcColsPerLane;   // 0..kFlashTile-1
-                            int r4 = (lane_pack % kTcColsPerLane) * kTcVec;  // 0/4/8/12
-                            __half2 h01 = __float2half2_rn(0.0f);
-                            __half2 h23 = __float2half2_rn(0.0f);
-                            int physical_t = physical_tile[c];
-                            if (physical_t >= 0) {
-                                const __nv_fp8_e4m3* k_vec_fp8 =
-                                    k_base_fp8 + physical_t * head_dim + kk * kTcK + r4;
-                                SplitFp8x4Pack kpack = split_load_fp8x4(k_vec_fp8);
-                                h01 = __halves2half2(
-                                    static_cast<__half>(kpack.v[0]),
-                                    static_cast<__half>(kpack.v[1]));
-                                h23 = __halves2half2(
-                                    static_cast<__half>(kpack.v[2]),
-                                    static_cast<__half>(kpack.v[3]));
-                            }
-                            *reinterpret_cast<__half2*>(
-                                sm_tc_b + warp_b_base + c * kTcK + r4) = h01;
-                            *reinterpret_cast<__half2*>(
-                                sm_tc_b + warp_b_base + c * kTcK + r4 + 2) = h23;
+                        if (lane_pack_active) {
+                            *reinterpret_cast<__half2*>(lane_b_ptr) = lane_h01;
+                            *reinterpret_cast<__half2*>(lane_b_ptr + 2) = lane_h23;
                         }
-                        if (debug_lane) local_qk_tc_pack_cycles += (clock64() - t_tc_pack_begin);
+                        if (debug_lane) {
+                            unsigned long long tc_pack_total = (clock64() - t_tc_pack_begin);
+                            local_qk_tc_pack_cycles += tc_pack_total;
+                            local_qk_cycles += tc_pack_total;
+                        }
                         __syncwarp();
                         unsigned long long t_tc_mma_begin = 0;
                         if (debug_lane) t_tc_mma_begin = clock64();
@@ -1553,17 +1568,33 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcM, kTcN, kTcK, __half, nvcuda::wmma::col_major> b_frag;
                         nvcuda::wmma::load_matrix_sync(a_frag, sm_tc_a + warp_a_base, kTcK);
                         nvcuda::wmma::load_matrix_sync(b_frag, sm_tc_b + warp_b_base, kTcK);
+                        if (kk + 1 < kTcSteps && lane_k_ptr_base != nullptr) {
+                            unsigned long long t_kload_begin = 0;
+                            if (debug_lane) t_kload_begin = clock64();
+                            SplitFp8x4Pack kpack_next = split_load_fp8x4(lane_k_ptr_base + (kk + 1) * kTcK);
+                            lane_h01 = __halves2half2(
+                                static_cast<__half>(kpack_next.v[0]),
+                                static_cast<__half>(kpack_next.v[1]));
+                            lane_h23 = __halves2half2(
+                                static_cast<__half>(kpack_next.v[2]),
+                                static_cast<__half>(kpack_next.v[3]));
+                            if (debug_lane) {
+                                unsigned long long kload = (clock64() - t_kload_begin);
+                                local_qk_load_cycles += kload;
+                                local_qk_cycles += kload;
+                            }
+                        }
                         nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                        if (debug_lane) local_qk_tc_mma_cycles += (clock64() - t_tc_mma_begin);
+                        if (debug_lane) {
+                            unsigned long long tc_mma = (clock64() - t_tc_mma_begin);
+                            local_qk_tc_mma_cycles += tc_mma;
+                            local_qk_cycles += tc_mma;
+                        }
                     }
-                    if (debug_lane) local_qk_load_cycles += (clock64() - t_qk_load_begin);
-                    unsigned long long t_qk_fma_begin = 0;
-                    if (debug_lane) t_qk_fma_begin = clock64();
                     unsigned long long t_tc_unpack_begin = 0;
                     if (debug_lane) t_tc_unpack_begin = clock64();
                     nvcuda::wmma::store_matrix_sync(sm_tc_c + warp_c_base, c_frag, kTcN, nvcuda::wmma::mem_row_major);
                     __syncwarp();
-                    if (debug_lane) local_qk_fma_cycles += (clock64() - t_qk_fma_begin);
 
                     float score0_lane = -INFINITY;
                     float score1_lane = -INFINITY;
@@ -1573,7 +1604,11 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                             score1_lane = sm_tc_c[warp_c_base + kTcN + lane_id];
                         }
                     }
-                    if (debug_lane) local_qk_tc_unpack_cycles += (clock64() - t_tc_unpack_begin);
+                    if (debug_lane) {
+                        unsigned long long tc_unpack = (clock64() - t_tc_unpack_begin);
+                        local_qk_tc_unpack_cycles += tc_unpack;
+                        local_qk_cycles += tc_unpack;
+                    }
                     int d0 = lane_id * kElemsPerLane;
                     SplitFp8x4Pack vpack_prefetch[kFlashTile];
                     unsigned long long t_vprefetch_begin = 0;
@@ -1589,13 +1624,18 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         vpack_prefetch[ti] = split_load_fp8x4(v_vec_fp8 + d0);
                     }
                     if (debug_lane) local_value_load_cycles += (clock64() - t_vprefetch_begin);
-                    unsigned long long t_qk_reduce_begin = 0;
-                    if (debug_lane) t_qk_reduce_begin = clock64();
                     #pragma unroll
                     for (int ti = 0; ti < kFlashTile; ti++) {
                         if ((valid_mask & (1u << ti)) == 0) continue;
+                        unsigned long long t_qk_reduce_begin = 0;
+                        if (debug_lane) t_qk_reduce_begin = clock64();
                         float score0 = __shfl_sync(0xffffffff, score0_lane, ti) * attn_scale;
                         float score1 = __shfl_sync(0xffffffff, score1_lane, ti) * attn_scale;
+                        if (debug_lane) {
+                            unsigned long long t_qk_reduce = (clock64() - t_qk_reduce_begin);
+                            local_qk_reduce_cycles += t_qk_reduce;
+                            local_qk_cycles += t_qk_reduce;
+                        }
 
                         unsigned long long t_softmax_begin = 0;
                         if (debug_lane) t_softmax_begin = clock64();
@@ -1656,8 +1696,6 @@ __global__ void decode_attention_cache_flash_phase1_gqa2_kernel_t(
                         m1 = m_new1;
                         if (debug_lane) local_value_bookkeep_cycles += (clock64() - t_vbook_begin);
                     }
-                    if (debug_lane) local_qk_reduce_cycles += (clock64() - t_qk_reduce_begin);
-                    if (debug_lane) local_qk_cycles += (clock64() - t_qk_begin);
                 } else
 #endif
                 {

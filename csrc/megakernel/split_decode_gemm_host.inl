@@ -1038,7 +1038,16 @@ extern "C" void launch_split_decode_gemm(
                             (unsigned long long)sum_qk_tc_pack_cycles, to_ms(sum_qk_tc_pack_cycles), 100.0 * (double)sum_qk_tc_pack_cycles / denom_overlap,
                             (unsigned long long)sum_qk_tc_mma_cycles, to_ms(sum_qk_tc_mma_cycles), 100.0 * (double)sum_qk_tc_mma_cycles / denom_overlap,
                             (unsigned long long)sum_qk_tc_unpack_cycles, to_ms(sum_qk_tc_unpack_cycles), 100.0 * (double)sum_qk_tc_unpack_cycles / denom_overlap);
-                        std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_note: ov=percent_vs_total_cycles (may >100%%), norm=percent_vs_known_components (<=100%%)\n");
+                        unsigned long long sum_qk_mutual_cycles =
+                            sum_qk_load_cycles + sum_qk_fma_cycles + sum_qk_reduce_cycles +
+                            sum_qk_tc_pack_cycles + sum_qk_tc_mma_cycles + sum_qk_tc_unpack_cycles;
+                        double denom_qk = (sum_qk_cycles > 0) ? (double)sum_qk_cycles : 1.0;
+                        std::printf(
+                            "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_qk_mutual (phase12): qk_known=%llu/%.3fms qk_total=%llu/%.3fms norm_qk=%.1f%%\n",
+                            (unsigned long long)sum_qk_mutual_cycles, to_ms(sum_qk_mutual_cycles),
+                            (unsigned long long)sum_qk_cycles, to_ms(sum_qk_cycles),
+                            100.0 * (double)sum_qk_mutual_cycles / denom_qk);
+                        std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_note: ov=percent_vs_total_cycles (may >100%%), norm=percent_vs_known_components (<=100%%), qk_mutual=non-overlap qk components\n");
                     }
 
                     if (have_phase_debug) {
@@ -1241,7 +1250,16 @@ extern "C" void launch_split_decode_gemm(
                             (unsigned long long)sum_qk_tc_pack_cycles, to_ms(sum_qk_tc_pack_cycles), 100.0 * (double)sum_qk_tc_pack_cycles / denom_overlap,
                             (unsigned long long)sum_qk_tc_mma_cycles, to_ms(sum_qk_tc_mma_cycles), 100.0 * (double)sum_qk_tc_mma_cycles / denom_overlap,
                             (unsigned long long)sum_qk_tc_unpack_cycles, to_ms(sum_qk_tc_unpack_cycles), 100.0 * (double)sum_qk_tc_unpack_cycles / denom_overlap);
-                        std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_note: ov=percent_vs_total_cycles (may >100%%), norm=percent_vs_known_components (<=100%%)\n");
+                        unsigned long long sum_qk_mutual_cycles =
+                            sum_qk_load_cycles + sum_qk_fma_cycles + sum_qk_reduce_cycles +
+                            sum_qk_tc_pack_cycles + sum_qk_tc_mma_cycles + sum_qk_tc_unpack_cycles;
+                        double denom_qk = (sum_qk_cycles > 0) ? (double)sum_qk_cycles : 1.0;
+                        std::printf(
+                            "[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_qk_mutual: qk_known=%llu/%.3fms qk_total=%llu/%.3fms norm_qk=%.1f%%\n",
+                            (unsigned long long)sum_qk_mutual_cycles, to_ms(sum_qk_mutual_cycles),
+                            (unsigned long long)sum_qk_cycles, to_ms(sum_qk_cycles),
+                            100.0 * (double)sum_qk_mutual_cycles / denom_qk);
+                        std::printf("[MEGAQWEN_DEBUG] FLASH_DECODE breakdown_note: ov=percent_vs_total_cycles (may >100%%), norm=percent_vs_known_components (<=100%%), qk_mutual=non-overlap qk components\n");
                     }
 
                     struct FlashPair {
