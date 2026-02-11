@@ -27,6 +27,7 @@ def _compile_kernels():
     silu_mul_src = _get_cuda_source("silu_mul.cu")
     rope_src = _get_cuda_source("rope.cu")
     attention_decode_src = _get_cuda_source("attention_decode.cu")
+    audio_attention_src = _get_cuda_source("audio_attention.cu")
 
     # Combined source with Python bindings
     cpp_src = """
@@ -89,6 +90,21 @@ extern "C" void launch_attention_decode(
     int n_kv_heads,
     int head_dim,
     int max_seq_len,
+    float scale,
+    cudaStream_t stream
+);
+
+extern "C" void launch_audio_attention(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* out,
+    const int* cu_seqlens,
+    int num_segments,
+    int batch_size,
+    int n_heads,
+    int seq_len,
+    int head_dim,
     float scale,
     cudaStream_t stream
 );
@@ -274,16 +290,78 @@ torch::Tensor cuda_attention_decode(
     return out.unsqueeze(2);
 }
 
+torch::Tensor cuda_audio_attention(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::optional<torch::Tensor> cu_seqlens_opt,
+    double scale
+) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA tensors");
+    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
+    TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
+    TORCH_CHECK(v.dtype() == torch::kBFloat16, "v must be bfloat16");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "q/k/v must be contiguous");
+    TORCH_CHECK(q.sizes() == k.sizes() && q.sizes() == v.sizes(), "q/k/v shape mismatch");
+    TORCH_CHECK(q.dim() == 4, "q/k/v must be [B,H,T,D]");
+
+    int batch = q.size(0);
+    int n_heads = q.size(1);
+    int seq_len = q.size(2);
+    int head_dim = q.size(3);
+
+    const int* cu_ptr = nullptr;
+    int num_segments = 0;
+    if (cu_seqlens_opt.has_value() && cu_seqlens_opt->defined()) {
+        auto cu = cu_seqlens_opt.value();
+        TORCH_CHECK(cu.is_cuda(), "cu_seqlens must be CUDA when provided");
+        TORCH_CHECK(cu.dtype() == torch::kInt32, "cu_seqlens must be int32");
+        TORCH_CHECK(cu.is_contiguous(), "cu_seqlens must be contiguous");
+        TORCH_CHECK(cu.dim() == 1 && cu.size(0) >= 2, "cu_seqlens must be 1D with >=2 elements");
+        cu_ptr = cu.data_ptr<int>();
+        num_segments = static_cast<int>(cu.size(0)) - 1;
+    }
+
+    auto out = torch::empty_like(q);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    launch_audio_attention(
+        q.data_ptr(),
+        k.data_ptr(),
+        v.data_ptr(),
+        out.data_ptr(),
+        cu_ptr,
+        num_segments,
+        batch,
+        n_heads,
+        seq_len,
+        head_dim,
+        static_cast<float>(scale),
+        stream
+    );
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rms_norm", &cuda_rms_norm, "CUDA RMSNorm");
     m.def("silu_mul", &cuda_silu_mul, "CUDA fused SiLU * mul");
     m.def("rope", &cuda_rope, "CUDA RoPE (prefill)");
     m.def("rope_single", &cuda_rope_single, "CUDA RoPE (decode single token)");
     m.def("attention_decode", &cuda_attention_decode, "CUDA attention decode");
+    m.def("audio_attention", &cuda_audio_attention, "CUDA audio self-attention (B,H,T,D)");
 }
 """
 
-    combined_cuda_src = rms_norm_src + "\n\n" + silu_mul_src + "\n\n" + rope_src + "\n\n" + attention_decode_src
+    combined_cuda_src = (
+        rms_norm_src
+        + "\n\n"
+        + silu_mul_src
+        + "\n\n"
+        + rope_src
+        + "\n\n"
+        + attention_decode_src
+        + "\n\n"
+        + audio_attention_src
+    )
 
     _cuda_kernels = load_inline(
         name="qwen3_cuda_kernels",

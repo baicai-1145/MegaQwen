@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoFeatureExtractor, AutoTokenizer
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.utils.import_utils import is_flash_attn_2_available, is_flash_attn_3_available
 
 from .safetensors_loader import load_tensors
 from .profiler import StageTimer
@@ -89,6 +93,12 @@ def load_wav_mono(path: str | Path, target_sr: int = 16000) -> tuple[np.ndarray,
 
 
 class Qwen3ASRAudioTower(nn.Module):
+    _compile_warned: bool = False
+    _attn_impl_warned: bool = False
+    _cuda_attn_warned: bool = False
+    _runtime_debug_printed: bool = False
+    _attn_fallback_warned: bool = False
+
     def __init__(self, *, audio_config: dict, out_hidden: int):
         super().__init__()
         try:
@@ -104,6 +114,267 @@ class Qwen3ASRAudioTower(nn.Module):
         cfg_dict["output_dim"] = int(out_hidden)
         cfg = Qwen3ASRAudioEncoderConfig(**cfg_dict)
         self.inner = Qwen3ASRAudioEncoder(cfg)
+        self._inference_prepared = False
+        self._compiled = False
+        self._cuda_audio_attn_enabled = False
+
+    @staticmethod
+    def _env_flag(name: str, default: bool) -> bool:
+        value = os.environ.get(name)
+        if value is None or value == "":
+            return default
+        return value not in ("0", "false", "False", "no", "No")
+
+    def _select_audio_attn_impl(self) -> str:
+        req = os.environ.get("MEGAQWEN_AUDIO_TOWER_ATTN_IMPL", "auto").strip().lower()
+        available = set(ALL_ATTENTION_FUNCTIONS.keys())
+        available.add("eager")
+        fa2_ok = bool(torch.cuda.is_available() and is_flash_attn_2_available())
+        fa3_ok = bool(torch.cuda.is_available() and is_flash_attn_3_available())
+
+        def _fallback_impl() -> str:
+            if "sdpa" in available:
+                return "sdpa"
+            return "eager"
+
+        if req in ("", "auto"):
+            if fa2_ok and "flash_attention_2" in available:
+                return "flash_attention_2"
+            if fa3_ok and "flash_attention_3" in available:
+                return "flash_attention_3"
+            if "sdpa" in available:
+                return "sdpa"
+            return "eager"
+
+        if req == "flash_attention_2" and not fa2_ok:
+            if not Qwen3ASRAudioTower._attn_fallback_warned:
+                Qwen3ASRAudioTower._attn_fallback_warned = True
+                print("[MEGAQWEN_ASR] audio tower flash_attention_2 unavailable, fallback to sdpa/eager")
+            return _fallback_impl()
+        if req == "flash_attention_3" and not fa3_ok:
+            if not Qwen3ASRAudioTower._attn_fallback_warned:
+                Qwen3ASRAudioTower._attn_fallback_warned = True
+                print("[MEGAQWEN_ASR] audio tower flash_attention_3 unavailable, fallback to sdpa/eager")
+            return _fallback_impl()
+
+        if req in available:
+            return req
+        if not Qwen3ASRAudioTower._attn_impl_warned:
+            Qwen3ASRAudioTower._attn_impl_warned = True
+            print(f"[MEGAQWEN_ASR] unknown audio attn impl '{req}', fallback to auto")
+        if fa2_ok and "flash_attention_2" in available:
+            return "flash_attention_2"
+        if fa3_ok and "flash_attention_3" in available:
+            return "flash_attention_3"
+        if "sdpa" in available:
+            return "sdpa"
+        return "eager"
+
+    def _apply_audio_attn_impl(self, impl: str) -> None:
+        if hasattr(self.inner, "config"):
+            self.inner.config._attn_implementation = impl
+        layers = getattr(self.inner, "layers", None)
+        if layers is not None:
+            for layer in layers:
+                attn = getattr(layer, "self_attn", None)
+                if attn is not None and hasattr(attn, "config"):
+                    attn.config._attn_implementation = impl
+
+    @staticmethod
+    def _make_cuda_audio_forward(
+        original_forward,
+        kernels,
+        *,
+        force_cuda_path: bool,
+        debug: bool,
+        debug_timing: bool,
+        timing_every: int,
+        timing_layer: int,
+    ):
+        def _forward_cuda(
+            self_attn,
+            hidden_states: torch.Tensor,
+            cu_seqlens: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            **kwargs,
+        ):
+            can_use_cuda_path = (
+                (not self_attn.training)
+                and hidden_states.is_cuda
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.dim() == 2
+                and (cu_seqlens is not None)
+            )
+            if not can_use_cuda_path:
+                if debug and (not getattr(self_attn, "_megaqwen_cuda_audio_skip_warned", False)):
+                    self_attn._megaqwen_cuda_audio_skip_warned = True
+                    reasons: list[str] = []
+                    if self_attn.training:
+                        reasons.append("training=1")
+                    if not hidden_states.is_cuda:
+                        reasons.append("not_cuda")
+                    if hidden_states.dtype != torch.bfloat16:
+                        reasons.append(f"dtype={hidden_states.dtype}")
+                    if hidden_states.dim() != 2:
+                        reasons.append(f"dim={hidden_states.dim()}")
+                    if cu_seqlens is None:
+                        reasons.append("cu_seqlens=None")
+                    layer_idx = int(getattr(self_attn, "_megaqwen_audio_layer_idx", -1))
+                    print(
+                        f"[MEGAQWEN_ASR] audio cuda attention skip layer={layer_idx} "
+                        f"reasons={','.join(reasons) if reasons else 'unknown'}"
+                    )
+                return original_forward(
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+
+            try:
+                layer_idx = int(getattr(self_attn, "_megaqwen_audio_layer_idx", -1))
+                collect_timing = debug_timing and (timing_layer < 0 or layer_idx == timing_layer)
+                if collect_timing:
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_qkv = torch.cuda.Event(enable_timing=True)
+                    ev_kernel = torch.cuda.Event(enable_timing=True)
+                    ev_out = torch.cuda.Event(enable_timing=True)
+                    ev_s.record()
+
+                seq_length, _ = hidden_states.size()
+                query_states = self_attn.q_proj(hidden_states).reshape(seq_length, self_attn.num_heads, -1)
+                key_states = self_attn.k_proj(hidden_states).reshape(seq_length, self_attn.num_heads, -1)
+                value_states = self_attn.v_proj(hidden_states).reshape(seq_length, self_attn.num_heads, -1)
+
+                query_states = query_states.transpose(0, 1).unsqueeze(0).contiguous()  # [1,H,T,D]
+                key_states = key_states.transpose(0, 1).unsqueeze(0).contiguous()  # [1,H,T,D]
+                value_states = value_states.transpose(0, 1).unsqueeze(0).contiguous()  # [1,H,T,D]
+                if collect_timing:
+                    ev_qkv.record()
+
+                cu_seqlens_cuda = cu_seqlens
+                if cu_seqlens_cuda.device != hidden_states.device:
+                    cu_seqlens_cuda = cu_seqlens_cuda.to(device=hidden_states.device, non_blocking=True)
+                if cu_seqlens_cuda.dtype != torch.int32:
+                    cu_seqlens_cuda = cu_seqlens_cuda.to(dtype=torch.int32)
+                cu_seqlens_cuda = cu_seqlens_cuda.contiguous()
+
+                # kernel out: [B,H,T,D] -> audio attention expected layout [B,T,H,D]
+                attn_output = kernels.audio_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    cu_seqlens_cuda,
+                    float(self_attn.scaling),
+                ).transpose(1, 2).contiguous()
+                if collect_timing:
+                    ev_kernel.record()
+                attn_output = attn_output.reshape(seq_length, -1).contiguous()
+                out = self_attn.out_proj(attn_output)
+                if collect_timing:
+                    ev_out.record()
+                    torch.cuda.synchronize(hidden_states.device)
+                    qkv_ms = ev_s.elapsed_time(ev_qkv)
+                    kernel_ms = ev_qkv.elapsed_time(ev_kernel)
+                    out_ms = ev_kernel.elapsed_time(ev_out)
+                    total_ms = ev_s.elapsed_time(ev_out)
+
+                    stat = getattr(
+                        self_attn,
+                        "_megaqwen_cuda_audio_stat",
+                        {"calls": 0, "qkv_ms": 0.0, "kernel_ms": 0.0, "out_ms": 0.0, "total_ms": 0.0},
+                    )
+                    stat["calls"] += 1
+                    stat["qkv_ms"] += float(qkv_ms)
+                    stat["kernel_ms"] += float(kernel_ms)
+                    stat["out_ms"] += float(out_ms)
+                    stat["total_ms"] += float(total_ms)
+                    self_attn._megaqwen_cuda_audio_stat = stat
+
+                    if stat["calls"] % max(1, timing_every) == 0:
+                        calls = float(stat["calls"])
+                        print(
+                            "[MEGAQWEN_ASR] audio cuda attn timing "
+                            f"layer={layer_idx} calls={int(calls)} "
+                            f"qkv_ms={stat['qkv_ms']/calls:.4f} "
+                            f"kernel_ms={stat['kernel_ms']/calls:.4f} "
+                            f"out_ms={stat['out_ms']/calls:.4f} "
+                            f"total_ms={stat['total_ms']/calls:.4f}"
+                        )
+                return out
+            except Exception as exc:
+                if force_cuda_path:
+                    raise
+                if debug and (not getattr(self_attn, "_megaqwen_cuda_audio_warned", False)):
+                    self_attn._megaqwen_cuda_audio_warned = True
+                    print(f"[MEGAQWEN_ASR] audio cuda attention fallback to original forward: {exc}")
+                return original_forward(
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+
+        return _forward_cuda
+
+    def _install_cuda_audio_attention(self) -> bool:
+        if not self._env_flag("MEGAQWEN_AUDIO_TOWER_CUDA_ATTN", False):
+            return False
+        if not torch.cuda.is_available():
+            if not Qwen3ASRAudioTower._cuda_attn_warned:
+                Qwen3ASRAudioTower._cuda_attn_warned = True
+                print("[MEGAQWEN_ASR] audio cuda attention disabled: cuda unavailable")
+            return False
+
+        force_cuda_path = self._env_flag("MEGAQWEN_AUDIO_TOWER_CUDA_ATTN_FORCE", False)
+        debug = self._env_flag("MEGAQWEN_AUDIO_TOWER_CUDA_ATTN_DEBUG", False)
+        debug_timing = self._env_flag("MEGAQWEN_AUDIO_TOWER_CUDA_ATTN_TIMING", False)
+        timing_every = int(os.environ.get("MEGAQWEN_AUDIO_TOWER_CUDA_ATTN_TIMING_EVERY", "128"))
+        timing_layer = int(os.environ.get("MEGAQWEN_AUDIO_TOWER_CUDA_ATTN_TIMING_LAYER", "0"))
+
+        try:
+            from csrc.kernels import get_kernels
+
+            kernels = get_kernels()
+            if not hasattr(kernels, "audio_attention"):
+                raise RuntimeError("missing audio_attention kernel binding")
+        except Exception as exc:
+            if not Qwen3ASRAudioTower._cuda_attn_warned:
+                Qwen3ASRAudioTower._cuda_attn_warned = True
+                print(f"[MEGAQWEN_ASR] audio cuda attention init failed: {exc}")
+            if force_cuda_path:
+                raise
+            return False
+
+        patched_layers = 0
+        layers = getattr(self.inner, "layers", None)
+        if layers is None:
+            return False
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            if getattr(attn, "_megaqwen_cuda_audio_patched", False):
+                continue
+            original_forward = attn.forward
+            forward_cuda = self._make_cuda_audio_forward(
+                original_forward,
+                kernels,
+                force_cuda_path=force_cuda_path,
+                debug=debug,
+                debug_timing=debug_timing,
+                timing_every=timing_every,
+                timing_layer=timing_layer,
+            )
+            attn.forward = MethodType(forward_cuda, attn)
+            attn._megaqwen_cuda_audio_patched = True
+            attn._megaqwen_audio_layer_idx = patched_layers
+            patched_layers += 1
+
+        self._cuda_audio_attn_enabled = patched_layers > 0
+        if self._cuda_audio_attn_enabled:
+            print(f"[MEGAQWEN_ASR] audio cuda attention enabled on {patched_layers} layers")
+        return self._cuda_audio_attn_enabled
 
     def forward(self, input_features: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
         if input_features.dim() != 3:
@@ -122,6 +393,12 @@ class Qwen3ASRAudioTower(nn.Module):
                 device=input_features.device,
             )
 
+        if bsz == 1:
+            fl = int(feature_lens[0].item())
+            one_feat = input_features[0, :, :fl].contiguous()
+            out = self.inner(one_feat, feature_lens=feature_lens[:1]).last_hidden_state
+            return out.unsqueeze(0) if out.dim() == 2 else out
+
         out_list: list[torch.Tensor] = []
         for idx in range(bsz):
             fl = int(feature_lens[idx].item())
@@ -131,7 +408,82 @@ class Qwen3ASRAudioTower(nn.Module):
         return nn.utils.rnn.pad_sequence(out_list, batch_first=True)
 
     def prepare_for_inference(self) -> None:
-        pass
+        if self._inference_prepared:
+            return
+        self._inference_prepared = True
+
+        if torch.cuda.is_available():
+            if self._env_flag("MEGAQWEN_AUDIO_TOWER_ALLOW_TF32", True):
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            if self._env_flag("MEGAQWEN_AUDIO_TOWER_CUDNN_BENCHMARK", True):
+                torch.backends.cudnn.benchmark = True
+
+        attn_impl = self._select_audio_attn_impl()
+        self._apply_audio_attn_impl(attn_impl)
+        if not Qwen3ASRAudioTower._attn_impl_warned:
+            Qwen3ASRAudioTower._attn_impl_warned = True
+            print(f"[MEGAQWEN_ASR] audio tower attention impl={attn_impl}")
+
+        self._install_cuda_audio_attention()
+
+        if torch.cuda.is_available() and self._env_flag("MEGAQWEN_AUDIO_TOWER_ENABLE_FLASH_SDP", True):
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+
+        if (not torch.cuda.is_available()) or (not self._env_flag("MEGAQWEN_AUDIO_TOWER_COMPILE", True)):
+            return
+        compile_with_flash_attn = self._env_flag("MEGAQWEN_AUDIO_TOWER_COMPILE_WITH_FLASH_ATTN", False)
+        if attn_impl in ("flash_attention_2", "flash_attention_3") and (not compile_with_flash_attn):
+            if self._env_flag("MEGAQWEN_AUDIO_TOWER_DEBUG", False) and (not Qwen3ASRAudioTower._runtime_debug_printed):
+                Qwen3ASRAudioTower._runtime_debug_printed = True
+                print(
+                    "[MEGAQWEN_ASR] audio tower runtime debug: "
+                    "compile skipped because flash-attn varlen may conflict with torch.compile "
+                    "(set MEGAQWEN_AUDIO_TOWER_COMPILE_WITH_FLASH_ATTN=1 to force)"
+                )
+            return
+        compile_with_cuda_attn = self._env_flag("MEGAQWEN_AUDIO_TOWER_COMPILE_WITH_CUDA_ATTN", False)
+        if self._cuda_audio_attn_enabled and (not compile_with_cuda_attn):
+            if self._env_flag("MEGAQWEN_AUDIO_TOWER_DEBUG", False) and (not Qwen3ASRAudioTower._runtime_debug_printed):
+                Qwen3ASRAudioTower._runtime_debug_printed = True
+                print(
+                    "[MEGAQWEN_ASR] audio tower runtime debug: "
+                    "compile skipped because CUDA attention is enabled and "
+                    "MEGAQWEN_AUDIO_TOWER_COMPILE_WITH_CUDA_ATTN=0"
+                )
+            return
+        if not hasattr(torch, "compile"):
+            return
+
+        compile_mode = os.environ.get("MEGAQWEN_AUDIO_TOWER_COMPILE_MODE", "reduce-overhead").strip() or "reduce-overhead"
+        compile_dynamic = self._env_flag("MEGAQWEN_AUDIO_TOWER_COMPILE_DYNAMIC", False)
+        compile_fullgraph = self._env_flag("MEGAQWEN_AUDIO_TOWER_COMPILE_FULLGRAPH", False)
+        compile_backend = os.environ.get("MEGAQWEN_AUDIO_TOWER_COMPILE_BACKEND", "").strip() or None
+
+        try:
+            compile_kwargs = {
+                "mode": compile_mode,
+                "dynamic": compile_dynamic,
+                "fullgraph": compile_fullgraph,
+            }
+            if compile_backend is not None:
+                compile_kwargs["backend"] = compile_backend
+            self.inner = torch.compile(self.inner, **compile_kwargs)
+            self._compiled = True
+            if self._env_flag("MEGAQWEN_AUDIO_TOWER_DEBUG", False) and (not Qwen3ASRAudioTower._runtime_debug_printed):
+                Qwen3ASRAudioTower._runtime_debug_printed = True
+                print(
+                    "[MEGAQWEN_ASR] audio tower runtime debug: "
+                    f"compiled=1 mode={compile_mode} dynamic={int(compile_dynamic)} "
+                    f"fullgraph={int(compile_fullgraph)} backend={compile_backend or 'default'} "
+                    f"cuda_attn={int(self._cuda_audio_attn_enabled)}"
+                )
+        except Exception as exc:
+            if not Qwen3ASRAudioTower._compile_warned:
+                Qwen3ASRAudioTower._compile_warned = True
+                print(f"[MEGAQWEN_ASR] audio tower torch.compile fallback to eager: {exc}")
 
     def state_dict(self, *args, **kwargs):
         return self.inner.state_dict(*args, **kwargs)
