@@ -1,7 +1,8 @@
-"""Sanity-check Qwen3-ASR-0.6B megakernel vs torch baseline on the same audio.
+"""Sanity-check Qwen3-ASR megakernel vs torch baseline on the same audio.
 
 Usage:
   python verify_asr_megakernel.py --model Qwen3-ASR-0.6B --audio your.wav --device cuda --dtype bf16
+  python verify_asr_megakernel.py --model Qwen3-ASR-1.7B --audio your.wav --device cuda --dtype bf16
 """
 
 import argparse

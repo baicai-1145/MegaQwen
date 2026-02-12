@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 static inline bool _env_enabled(const char* name, bool default_on = false) {
     const char* s = std::getenv(name);
@@ -19,6 +20,30 @@ static inline bool _env_enabled(const char* name, bool default_on = false) {
     }
     return true;
 }
+
+#ifndef MEGAQWEN_HIDDEN_SIZE
+#define MEGAQWEN_HIDDEN_SIZE 1024
+#endif
+#ifndef MEGAQWEN_INTERMEDIATE_SIZE
+#define MEGAQWEN_INTERMEDIATE_SIZE 3072
+#endif
+#ifndef MEGAQWEN_NUM_Q_HEADS
+#define MEGAQWEN_NUM_Q_HEADS 16
+#endif
+#ifndef MEGAQWEN_NUM_KV_HEADS
+#define MEGAQWEN_NUM_KV_HEADS 8
+#endif
+#ifndef MEGAQWEN_HEAD_DIM
+#define MEGAQWEN_HEAD_DIM 128
+#endif
+
+constexpr int MK_HIDDEN_SIZE = MEGAQWEN_HIDDEN_SIZE;
+constexpr int MK_INTERMEDIATE_SIZE = MEGAQWEN_INTERMEDIATE_SIZE;
+constexpr int MK_NUM_Q_HEADS = MEGAQWEN_NUM_Q_HEADS;
+constexpr int MK_NUM_KV_HEADS = MEGAQWEN_NUM_KV_HEADS;
+constexpr int MK_HEAD_DIM = MEGAQWEN_HEAD_DIM;
+constexpr int MK_Q_SIZE = MK_NUM_Q_HEADS * MK_HEAD_DIM;
+constexpr int MK_KV_SIZE = MK_NUM_KV_HEADS * MK_HEAD_DIM;
 
 // Must match the struct in fused_prefill.cu
 struct PrefillLayerWeights {
@@ -361,18 +386,18 @@ public:
         cublasCreate(&cublas_handle_);
 
         // Allocate KV cache
-        int kv_heads = 8;
-        int head_dim = 128;
+        int kv_heads = MK_NUM_KV_HEADS;
+        int head_dim = MK_HEAD_DIM;
         k_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         v_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
 
         // Allocate prefill buffers (sized for max_prefill_len) - all BF16 for cuBLAS
-        int hidden_size = 1024;
-        int q_size = 16 * 128;
-        int kv_size = 8 * 128;
-        int intermediate_size = 3072;
+        int hidden_size = MK_HIDDEN_SIZE;
+        int q_size = MK_Q_SIZE;
+        int kv_size = MK_KV_SIZE;
+        int intermediate_size = MK_INTERMEDIATE_SIZE;
 
         hidden_float_ = torch::empty({max_prefill_len, hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         residual_ = torch::empty({max_prefill_len, hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
@@ -403,7 +428,7 @@ public:
         g_normalized_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         attn_partial_max_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         attn_partial_sum_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        attn_partial_out_ = torch::empty({1184 * 128}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        attn_partial_out_ = torch::empty({1184 * MK_HEAD_DIM}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
         block_max_vals_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_idxs_ = torch::empty({1184}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -514,32 +539,32 @@ public:
                 split_attn_max_chunks_ = (max_seq_len_ + split_attn_chunk_size_ - 1) / split_attn_chunk_size_;
                 if (split_attn_max_chunks_ < 1) split_attn_max_chunks_ = 1;
                 split_attn_partial_m_ = torch::empty(
-                    {split_attn_max_chunks_, 16},
+                    {split_attn_max_chunks_, MK_NUM_Q_HEADS},
                     torch::dtype(torch::kFloat32).device(torch::kCUDA)
                 );
                 split_attn_partial_s_ = torch::empty(
-                    {split_attn_max_chunks_, 16},
+                    {split_attn_max_chunks_, MK_NUM_Q_HEADS},
                     torch::dtype(torch::kFloat32).device(torch::kCUDA)
                 );
                 split_attn_partial_out_ = torch::empty(
-                    {split_attn_max_chunks_, 16, 128},
+                    {split_attn_max_chunks_, MK_NUM_Q_HEADS, MK_HEAD_DIM},
                     torch::dtype(torch::kFloat32).device(torch::kCUDA)
                 );
                 if (split_kv_fp8_enabled_) {
                     split_k_cache_fp8_ = torch::zeros(
-                        {num_layers_, 8, max_seq_len_, 128},
+                        {num_layers_, MK_NUM_KV_HEADS, max_seq_len_, MK_HEAD_DIM},
                         torch::dtype(torch::kUInt8).device(torch::kCUDA)
                     );
                     split_v_cache_fp8_ = torch::zeros(
-                        {num_layers_, 8, max_seq_len_, 128},
+                        {num_layers_, MK_NUM_KV_HEADS, max_seq_len_, MK_HEAD_DIM},
                         torch::dtype(torch::kUInt8).device(torch::kCUDA)
                     );
                     split_k_scale_cache_ = torch::ones(
-                        {num_layers_, 8},
+                        {num_layers_, MK_NUM_KV_HEADS},
                         torch::dtype(torch::kFloat32).device(torch::kCUDA)
                     );
                     split_v_scale_cache_ = torch::ones(
-                        {num_layers_, 8},
+                        {num_layers_, MK_NUM_KV_HEADS},
                         torch::dtype(torch::kFloat32).device(torch::kCUDA)
                     );
                     std::printf("[MEGAQWEN_SPLIT] kv cache fp8 enabled (layout=%s)\n",
@@ -680,7 +705,7 @@ public:
             }
 
 	        position_ = 0;
-	        attn_scale_ = 1.0f / sqrtf(128.0f);
+	        attn_scale_ = 1.0f / sqrtf((float)MK_HEAD_DIM);
 	    }
 
     ~MegakernelPrefillDecoder() {
@@ -822,8 +847,11 @@ public:
         }
         int audio_len = audio_embeds.size(0);
         int hidden_size = audio_embeds.size(1);
-        if (hidden_size != 1024) {
-            throw std::runtime_error("audio_embeds hidden_size must be 1024 for Qwen3-0.6B");
+        if (hidden_size != MK_HIDDEN_SIZE) {
+            throw std::runtime_error(
+                "audio_embeds hidden_size mismatch with compiled megakernel spec: expected=" +
+                std::to_string(MK_HIDDEN_SIZE) + ", got=" + std::to_string(hidden_size)
+            );
         }
         if (audio_len <= 0) {
             throw std::runtime_error("audio_embeds must have audio_len > 0");

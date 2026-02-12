@@ -4,6 +4,30 @@
 #include <cstdlib>
 #include <cstdlib>
 
+#ifndef MEGAQWEN_HIDDEN_SIZE
+#define MEGAQWEN_HIDDEN_SIZE 1024
+#endif
+#ifndef MEGAQWEN_INTERMEDIATE_SIZE
+#define MEGAQWEN_INTERMEDIATE_SIZE 3072
+#endif
+#ifndef MEGAQWEN_NUM_Q_HEADS
+#define MEGAQWEN_NUM_Q_HEADS 16
+#endif
+#ifndef MEGAQWEN_NUM_KV_HEADS
+#define MEGAQWEN_NUM_KV_HEADS 8
+#endif
+#ifndef MEGAQWEN_HEAD_DIM
+#define MEGAQWEN_HEAD_DIM 128
+#endif
+
+constexpr int MK_HIDDEN_SIZE = MEGAQWEN_HIDDEN_SIZE;
+constexpr int MK_INTERMEDIATE_SIZE = MEGAQWEN_INTERMEDIATE_SIZE;
+constexpr int MK_NUM_Q_HEADS = MEGAQWEN_NUM_Q_HEADS;
+constexpr int MK_NUM_KV_HEADS = MEGAQWEN_NUM_KV_HEADS;
+constexpr int MK_HEAD_DIM = MEGAQWEN_HEAD_DIM;
+constexpr int MK_Q_SIZE = MK_NUM_Q_HEADS * MK_HEAD_DIM;
+constexpr int MK_KV_SIZE = MK_NUM_KV_HEADS * MK_HEAD_DIM;
+
 // Must match the struct in fused_decode_ldg.cu
 struct LDGLayerWeights {
     const void* input_layernorm_weight;
@@ -98,18 +122,18 @@ public:
                    num_layers * sizeof(LDGLayerWeights), cudaMemcpyHostToDevice);
 
         // Allocate KV cache
-        int kv_heads = 8;
-        int head_dim = 128;
+        int kv_heads = MK_NUM_KV_HEADS;
+        int head_dim = MK_HEAD_DIM;
         k_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         v_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
 
         // Allocate intermediate buffers
-        int hidden_size = 1024;
-        int q_size = 16 * 128;
-        int kv_size = 8 * 128;
-        int intermediate_size = 3072;
+        int hidden_size = MK_HIDDEN_SIZE;
+        int q_size = MK_Q_SIZE;
+        int kv_size = MK_KV_SIZE;
+        int intermediate_size = MK_INTERMEDIATE_SIZE;
 
         hidden_buffer_ = torch::empty({hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         g_activations_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
@@ -122,11 +146,11 @@ public:
 	        g_normalized_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 	        attn_partial_max_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 	        attn_partial_sum_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-	        attn_partial_out_ = torch::empty({1184 * 128}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+	        attn_partial_out_ = torch::empty({1184 * MK_HEAD_DIM}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         // Attention scratch (for optional all-block attention path)
         attn_partial_max_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         attn_partial_sum_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        attn_partial_out_ = torch::empty({1184 * 128}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        attn_partial_out_ = torch::empty({1184 * MK_HEAD_DIM}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_vals_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 	        block_max_idxs_ = torch::empty({1184}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 	        output_token_ = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -153,7 +177,7 @@ public:
 	        if (decode_num_blocks_ > max_decode_blocks) decode_num_blocks_ = max_decode_blocks;
 
 	        position_ = 0;
-	        attn_scale_ = 1.0f / sqrtf(128.0f);
+	        attn_scale_ = 1.0f / sqrtf((float)MK_HEAD_DIM);
 
             // Decode backend:
             // - "coop" (default): cooperative-group LDG megakernel (launch_ldg_decode)

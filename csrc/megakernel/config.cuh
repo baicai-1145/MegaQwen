@@ -8,6 +8,37 @@
 namespace cg = cooperative_groups;
 
 // =============================================================================
+// Compile-time Model Spec (overridable via NVCC -D)
+// =============================================================================
+#ifndef MEGAQWEN_HIDDEN_SIZE
+#define MEGAQWEN_HIDDEN_SIZE 1024
+#endif
+
+#ifndef MEGAQWEN_INTERMEDIATE_SIZE
+#define MEGAQWEN_INTERMEDIATE_SIZE 3072
+#endif
+
+#ifndef MEGAQWEN_NUM_Q_HEADS
+#define MEGAQWEN_NUM_Q_HEADS 16
+#endif
+
+#ifndef MEGAQWEN_NUM_KV_HEADS
+#define MEGAQWEN_NUM_KV_HEADS 8
+#endif
+
+#ifndef MEGAQWEN_HEAD_DIM
+#define MEGAQWEN_HEAD_DIM 128
+#endif
+
+#ifndef MEGAQWEN_NUM_LAYERS
+#define MEGAQWEN_NUM_LAYERS 28
+#endif
+
+#ifndef MEGAQWEN_VOCAB_SIZE
+#define MEGAQWEN_VOCAB_SIZE 151936
+#endif
+
+// =============================================================================
 // Tunable Parameters
 // =============================================================================
 
@@ -30,11 +61,13 @@ constexpr int KV_BLOCK_SIZE = 64;       // KV cache positions per iteration
 // Model Dimensions (Qwen3-0.6B)
 // =============================================================================
 
-constexpr int HIDDEN_SIZE = 1024;
-constexpr int INTERMEDIATE_SIZE = 3072;
-constexpr int NUM_Q_HEADS = 16;
-constexpr int NUM_KV_HEADS = 8;
-constexpr int HEAD_DIM = 128;
+constexpr int HIDDEN_SIZE = MEGAQWEN_HIDDEN_SIZE;
+constexpr int INTERMEDIATE_SIZE = MEGAQWEN_INTERMEDIATE_SIZE;
+constexpr int NUM_Q_HEADS = MEGAQWEN_NUM_Q_HEADS;
+constexpr int NUM_KV_HEADS = MEGAQWEN_NUM_KV_HEADS;
+constexpr int HEAD_DIM = MEGAQWEN_HEAD_DIM;
+constexpr int NUM_LAYERS = MEGAQWEN_NUM_LAYERS;
+constexpr int VOCAB_SIZE = MEGAQWEN_VOCAB_SIZE;
 constexpr int Q_SIZE = NUM_Q_HEADS * HEAD_DIM;      // 2048
 constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM;    // 1024
 constexpr float RMS_NORM_EPS = 1e-6f;

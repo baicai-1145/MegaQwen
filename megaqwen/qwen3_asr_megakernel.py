@@ -330,11 +330,11 @@ class Qwen3ASRMegakernelOptions:
 
 
 class Qwen3ASRMegakernelModel:
-    """Qwen3-ASR-0.6B end-to-end (audio tower + megakernel prefill/decode).
+    """Qwen3-ASR end-to-end (audio tower + megakernel prefill/decode).
 
     Constraints:
-    - Currently only supports Qwen3-ASR-0.6B for the megakernel path because
-      the CUDA kernels are compile-time specialized for hidden_size=1024.
+    - Megakernel path is compile-time specialized per text config (hidden/intermediate/heads/layers).
+      Supported specs depend on successful JIT compile on the current GPU/toolchain.
     - Audio tower runs in PyTorch (Conv/GEMM/FlashAttention via SDPA).
     """
 
@@ -360,12 +360,6 @@ class Qwen3ASRMegakernelModel:
         thinker = cfg["thinker_config"]
         self._audio_cfg = thinker["audio_config"]
         self._text_cfg = thinker["text_config"]
-
-        if int(self._text_cfg["hidden_size"]) != 1024:
-            raise ValueError(
-                f"megakernel path only supports hidden_size=1024 (Qwen3-ASR-0.6B). "
-                f"Got hidden_size={self._text_cfg['hidden_size']}"
-            )
 
         # Tokenizer / feature extractor
         # Some recent tokenizers ship with a known-bad regex; `fix_mistral_regex`
@@ -462,7 +456,18 @@ class Qwen3ASRMegakernelModel:
         import sys
 
         sys.path.insert(0, str((Path(__file__).parent.parent / "csrc" / "megakernel").resolve()))
-        from megakernel_decode import _compile_prefill_kernel, load_qwen3_weights, NUM_LAYERS  # type: ignore
+        from megakernel_decode import _compile_prefill_kernel, configure_model_spec, get_active_model_spec, load_qwen3_weights  # type: ignore
+
+        configure_model_spec(
+            hidden_size=int(self._text_cfg["hidden_size"]),
+            intermediate_size=int(self._text_cfg["intermediate_size"]),
+            num_q_heads=int(self._text_cfg["num_attention_heads"]),
+            num_kv_heads=int(self._text_cfg["num_key_value_heads"]),
+            head_dim=int(self._text_cfg["head_dim"]),
+            num_layers=int(self._text_cfg["num_hidden_layers"]),
+            vocab_size=int(self._text_cfg.get("vocab_size", 151936)),
+        )
+        spec = get_active_model_spec()
 
         weights = load_qwen3_weights(str(self.model_dir), max_seq_len=self.opts.max_seq_len)
         kernel = _compile_prefill_kernel()
@@ -491,7 +496,7 @@ class Qwen3ASRMegakernelModel:
             weights.get("split_down_w4_packed", []),
             weights.get("split_down_w4_scales", []),
             weights.get("split_down_w4_codebook", []),
-            NUM_LAYERS,
+            int(spec["num_layers"]),
             self.opts.max_seq_len,
             self.opts.max_prefill_len,
         )

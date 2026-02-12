@@ -92,7 +92,7 @@ constexpr float LDG_RMS_EPS = 1e-6f;
 // LM head
 constexpr int LDG_LM_NUM_BLOCKS_DEFAULT = 1184;
 constexpr int LDG_LM_BLOCK_SIZE = 256;
-constexpr int LDG_VOCAB_SIZE = 151936;
+constexpr int LDG_VOCAB_SIZE = VOCAB_SIZE;
 
 struct LDGLayerWeights {
     const __nv_bfloat16* input_layernorm_weight;
@@ -792,4 +792,3 @@ __device__ void ldg_attention(
         dbg_stage[DBG_ATTN_SYNC] += (t1 - t0s2);
     }
 }
-

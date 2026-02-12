@@ -5,14 +5,14 @@ from pathlib import Path
 import torch
 from safetensors.torch import safe_open
 
-from megakernel_kernels import HEAD_DIM, HIDDEN_SIZE, NUM_LAYERS
+import megakernel_kernels as mk_kernels
 
 
-def _collect_layer_keys(text_prefix: str, lm_head_key: str | None) -> list[str]:
+def _collect_layer_keys(text_prefix: str, lm_head_key: str | None, num_layers: int) -> list[str]:
     keys = [text_prefix + "embed_tokens.weight", text_prefix + "norm.weight"]
     if lm_head_key is not None:
         keys.append(lm_head_key)
-    for i in range(NUM_LAYERS):
+    for i in range(num_layers):
         p = f"{text_prefix}layers.{i}."
         keys.extend(
             [
@@ -32,9 +32,9 @@ def _collect_layer_keys(text_prefix: str, lm_head_key: str | None) -> list[str]:
     return keys
 
 
-def _collect_linear_weight_keys(text_prefix: str, lm_head_key: str | None) -> list[str]:
+def _collect_linear_weight_keys(text_prefix: str, lm_head_key: str | None, num_layers: int) -> list[str]:
     keys: list[str] = []
-    for i in range(NUM_LAYERS):
+    for i in range(num_layers):
         p = f"{text_prefix}layers.{i}."
         keys.extend(
             [
@@ -106,9 +106,9 @@ def _bnb4_block_scales_and_codebook(
     return block_scales.contiguous(), codebook
 
 
-def _collect_layer_weights(tensors: dict[str, torch.Tensor], text_prefix: str) -> list[torch.Tensor]:
+def _collect_layer_weights(tensors: dict[str, torch.Tensor], text_prefix: str, num_layers: int) -> list[torch.Tensor]:
     layer_weights = []
-    for i in range(NUM_LAYERS):
+    for i in range(num_layers):
         p = f"{text_prefix}layers.{i}."
         layer_weights.extend(
             [
@@ -128,8 +128,8 @@ def _collect_layer_weights(tensors: dict[str, torch.Tensor], text_prefix: str) -
     return layer_weights
 
 
-def _build_rope_tables(max_seq_len: int, rope_theta: float) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, HEAD_DIM, 2, device="cuda", dtype=torch.float32) / HEAD_DIM))
+def _build_rope_tables(max_seq_len: int, rope_theta: float, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, device="cuda", dtype=torch.float32) / head_dim))
     positions = torch.arange(max_seq_len, device="cuda", dtype=torch.float32)
     freqs = torch.outer(positions, inv_freq)
     cos_table = torch.cos(freqs).repeat(1, 2).to(torch.bfloat16).contiguous()
@@ -230,16 +230,36 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
         if model_type == "qwen3_asr":
             text_prefix = "thinker.model."
             lm_head_key = "thinker.lm_head.weight"
-            hidden = cfg["thinker_config"]["text_config"].get("hidden_size")
-            if int(hidden) != HIDDEN_SIZE:
-                raise ValueError(
-                    f"Unsupported for megakernel (expected hidden_size={HIDDEN_SIZE}): {model_dir} hidden_size={hidden}"
-                )
-            rope_theta = float(cfg["thinker_config"]["text_config"].get("rope_theta", 1000000.0))
+            text_cfg = cfg["thinker_config"]["text_config"]
+            mk_kernels.configure_model_spec(
+                hidden_size=int(text_cfg["hidden_size"]),
+                intermediate_size=int(text_cfg["intermediate_size"]),
+                num_q_heads=int(text_cfg["num_attention_heads"]),
+                num_kv_heads=int(text_cfg["num_key_value_heads"]),
+                head_dim=int(text_cfg.get("head_dim", int(text_cfg["hidden_size"]) // int(text_cfg["num_attention_heads"]))),
+                num_layers=int(text_cfg["num_hidden_layers"]),
+                vocab_size=int(text_cfg.get("vocab_size", cfg.get("vocab_size", 151936))),
+            )
+            rope_theta = float(text_cfg.get("rope_theta", 1000000.0))
         else:
             text_prefix = "model."
             lm_head_key = "lm_head.weight"
             rope_theta = float(cfg.get("rope_theta", 1000000.0))
+            model_cfg = cfg
+            if "hidden_size" in model_cfg and "intermediate_size" in model_cfg:
+                mk_kernels.configure_model_spec(
+                    hidden_size=int(model_cfg["hidden_size"]),
+                    intermediate_size=int(model_cfg["intermediate_size"]),
+                    num_q_heads=int(model_cfg["num_attention_heads"]),
+                    num_kv_heads=int(model_cfg["num_key_value_heads"]),
+                    head_dim=int(model_cfg.get("head_dim", int(model_cfg["hidden_size"]) // int(model_cfg["num_attention_heads"]))),
+                    num_layers=int(model_cfg["num_hidden_layers"]),
+                    vocab_size=int(model_cfg.get("vocab_size", 151936)),
+                )
+
+        spec = mk_kernels.get_active_model_spec()
+        num_layers = int(spec["num_layers"])
+        head_dim = int(spec["head_dim"])
 
         try:
             from megaqwen.safetensors_loader import load_tensors
@@ -251,12 +271,12 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
         if resolved_lm_head_key not in available_keys:
             resolved_lm_head_key = text_prefix + "embed_tokens.weight"
 
-        tensors = load_tensors(model_dir, _collect_layer_keys(text_prefix, lm_head_key=None), device="cuda")
+        tensors = load_tensors(model_dir, _collect_layer_keys(text_prefix, lm_head_key=None, num_layers=num_layers), device="cuda")
         if resolved_lm_head_key not in tensors:
             lm_head_tensor = load_tensors(model_dir, [resolved_lm_head_key], device="cuda")[resolved_lm_head_key]
             tensors[resolved_lm_head_key] = lm_head_tensor
 
-        linear_weight_keys = _collect_linear_weight_keys(text_prefix, resolved_lm_head_key)
+        linear_weight_keys = _collect_linear_weight_keys(text_prefix, resolved_lm_head_key, num_layers=num_layers)
         quantized_weight_keys = [
             key
             for key in linear_weight_keys
@@ -298,7 +318,7 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
 
             if runtime_w4_enabled:
                 try:
-                    for i in range(NUM_LAYERS):
+                    for i in range(num_layers):
                         p = f"{text_prefix}layers.{i}."
                         q_key = p + "self_attn.q_proj.weight"
                         k_key = p + "self_attn.k_proj.weight"
@@ -395,7 +415,7 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
             raise RuntimeError(f"Unsupported dtype for {sample_key}: {tensors[sample_key].dtype}")
 
         tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-        cos_table, sin_table = _build_rope_tables(max_seq_len=max_seq_len, rope_theta=rope_theta)
+        cos_table, sin_table = _build_rope_tables(max_seq_len=max_seq_len, rope_theta=rope_theta, head_dim=head_dim)
 
         embed_weight = _as_bf16_contiguous(tensors[text_prefix + "embed_tokens.weight"])
         final_norm_weight = _as_bf16_contiguous(tensors[text_prefix + "norm.weight"])
@@ -403,7 +423,7 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
 
         return {
             "embed_weight": embed_weight,
-            "layer_weights": _collect_layer_weights(tensors, text_prefix=text_prefix),
+            "layer_weights": _collect_layer_weights(tensors, text_prefix=text_prefix, num_layers=num_layers),
             "final_norm_weight": final_norm_weight,
             "lm_head_weight": lm_head_weight,
             "cos_table": cos_table,
@@ -433,10 +453,24 @@ def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
+    model_cfg = getattr(model, "config", None)
+    if model_cfg is not None and hasattr(model_cfg, "hidden_size"):
+        mk_kernels.configure_model_spec(
+            hidden_size=int(model_cfg.hidden_size),
+            intermediate_size=int(model_cfg.intermediate_size),
+            num_q_heads=int(model_cfg.num_attention_heads),
+            num_kv_heads=int(model_cfg.num_key_value_heads),
+            head_dim=int(getattr(model_cfg, "head_dim", int(model_cfg.hidden_size) // int(model_cfg.num_attention_heads))),
+            num_layers=int(model_cfg.num_hidden_layers),
+            vocab_size=int(model_cfg.vocab_size),
+        )
+    spec = mk_kernels.get_active_model_spec()
+    num_layers = int(spec["num_layers"])
+    head_dim = int(spec["head_dim"])
 
     rope_theta = float(getattr(getattr(model, "config", None), "rope_theta", 1000000.0))
-    cos_table, sin_table = _build_rope_tables(max_seq_len=max_seq_len, rope_theta=rope_theta)
-    layer_weights = _collect_layer_weights(state, text_prefix="model.")
+    cos_table, sin_table = _build_rope_tables(max_seq_len=max_seq_len, rope_theta=rope_theta, head_dim=head_dim)
+    layer_weights = _collect_layer_weights(state, text_prefix="model.", num_layers=num_layers)
 
     del model
     torch.cuda.empty_cache()
