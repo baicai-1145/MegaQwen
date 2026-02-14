@@ -269,6 +269,33 @@ static inline const char* _split_gateup_w4_impl_name() {
     return _split_gateup_w4_warp_row_enabled() ? "warp_row" : "block";
 }
 
+static inline bool _split_down_w4_fast_exp_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_DOWN_W4_FAST_EXP");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
+static inline int _split_down_w4_row_tile() {
+    static int v = -1;
+    if (v > 0) return v;
+    v = 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_DOWN_W4_ROW_TILE");
+    if (s != nullptr && std::strcmp(s, "") != 0) {
+        int p = std::atoi(s);
+        if (p == 2 || p == 4) v = p;
+    }
+    return v;
+}
+
 static inline bool _split_qkv_w4_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
@@ -906,7 +933,7 @@ extern "C" void split_debug_stage_print_summary() {
         printf("         gemv=%5lld\n", agg.down_gemv);
         printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
                _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
-    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d k_fp8_enabled=%d flash_parts=%d flash_gqa_share=%d flash_gqa_mode=%s flash_fp8_tc_qk=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld gateup_w4_block=%d gateup_w4_impl=%s\n",
+    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d k_fp8_enabled=%d flash_parts=%d flash_gqa_share=%d flash_gqa_mode=%s flash_fp8_tc_qk=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld gateup_w4_block=%d gateup_w4_impl=%s down_w4_fast_exp=%d down_w4_row_tile=%d\n",
            _split_kv_layout_paged_enabled() ? "paged" : "contiguous",
            _split_kv_block_size(),
            _split_kv_fp8_enabled() ? 1 : 0,
@@ -925,7 +952,9 @@ extern "C" void split_debug_stage_print_summary() {
            agg.gateup_w4,
            agg.down_w4,
            _split_gateup_w4_block_threads(),
-           _split_gateup_w4_impl_name());
+           _split_gateup_w4_impl_name(),
+           _split_down_w4_fast_exp_enabled() ? 1 : 0,
+           _split_down_w4_row_tile());
 
         int layer_n = (int)agg.max_layer_seen;
         if (layer_n > SPLIT_DEBUG_MAX_LAYERS) layer_n = SPLIT_DEBUG_MAX_LAYERS;

@@ -211,6 +211,12 @@ __device__ __forceinline__ SplitW4x8Pack split_decode_w4x8(
     return out;
 }
 
+template <bool FAST_EXP>
+__device__ __forceinline__ float split_silu_value(float x) {
+    float ex = FAST_EXP ? __expf(-x) : expf(-x);
+    return x / (1.0f + ex);
+}
+
 // Quantize existing BF16 KV cache into FP8 cache for [start_pos, end_pos).
 // - k/v scale shape: [num_layers, num_kv_heads] (one scale per layer/head)
 // - k/v fp8 shape:   [num_layers, num_kv_heads, max_seq_len, head_dim]
@@ -3107,18 +3113,22 @@ __global__ void split_w4_downproj_residual_kernel(
 
     float local_sum = 0.0f;
     int64_t row_base = (int64_t)row * (int64_t)INTERMEDIATE_SIZE;
-    int vec_cols = INTERMEDIATE_SIZE & ~3;
-    for (int col = threadIdx.x * 4; col < vec_cols; col += kBlock * 4) {
+    int vec_cols = INTERMEDIATE_SIZE & ~7;
+    for (int col = threadIdx.x * 8; col < vec_cols; col += kBlock * 8) {
         unsigned long long t_deq = 0;
         if (debug_fine) t_deq = clock64();
         int64_t linear = row_base + (int64_t)col;
-        const uint16_t* pack_ptr = reinterpret_cast<const uint16_t*>(packed_w4 + (linear >> 1));
-        SplitW4x4Pack qw = split_decode_w4x4(split_load_u16(pack_ptr));
+        const uint32_t* pack_ptr = reinterpret_cast<const uint32_t*>(packed_w4 + (linear >> 1));
+        SplitW4x8Pack qw = split_decode_w4x8(split_load_u32(pack_ptr));
         float scale = scales[linear >> 6];
         float w0 = codebook[qw.q0] * scale;
         float w1 = codebook[qw.q1] * scale;
         float w2 = codebook[qw.q2] * scale;
         float w3 = codebook[qw.q3] * scale;
+        float w4 = codebook[qw.q4] * scale;
+        float w5 = codebook[qw.q5] * scale;
+        float w6 = codebook[qw.q6] * scale;
+        float w7 = codebook[qw.q7] * scale;
         if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
 
         unsigned long long t_fma = 0;
@@ -3127,7 +3137,12 @@ __global__ void split_w4_downproj_residual_kernel(
         float x1 = __bfloat162float(x_bf16[col + 1]);
         float x2 = __bfloat162float(x_bf16[col + 2]);
         float x3 = __bfloat162float(x_bf16[col + 3]);
-        local_sum += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        float x4 = __bfloat162float(x_bf16[col + 4]);
+        float x5 = __bfloat162float(x_bf16[col + 5]);
+        float x6 = __bfloat162float(x_bf16[col + 6]);
+        float x7 = __bfloat162float(x_bf16[col + 7]);
+        local_sum += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3 +
+                     w4 * x4 + w5 * x5 + w6 * x6 + w7 * x7;
         if (debug_fine) local_fma_cycles += (clock64() - t_fma);
     }
     for (int col = vec_cols + threadIdx.x; col < INTERMEDIATE_SIZE; col += kBlock) {
@@ -3162,7 +3177,8 @@ __global__ void split_w4_downproj_residual_kernel(
     }
 }
 
-__global__ void split_w4_silu_downproj_residual_kernel(
+template <bool FAST_EXP>
+__global__ void split_w4_silu_downproj_residual_kernel_t(
     const __nv_bfloat16* __restrict__ gateup_out_bf16,  // [2 * INTERMEDIATE_SIZE], [gate | up]
     const uint8_t* __restrict__ down_packed_w4,         // [HIDDEN_SIZE * INTERMEDIATE_SIZE / 2]
     const float* __restrict__ down_scales,              // [HIDDEN_SIZE * INTERMEDIATE_SIZE / 64]
@@ -3187,43 +3203,64 @@ __global__ void split_w4_silu_downproj_residual_kernel(
 
     float local_sum = 0.0f;
     int64_t row_base = (int64_t)out_idx * (int64_t)INTERMEDIATE_SIZE;
-    int vec_cols = INTERMEDIATE_SIZE & ~3;
-    for (int i = threadIdx.x * 4; i < vec_cols; i += kBlock * 4) {
+    int vec_cols = INTERMEDIATE_SIZE & ~7;
+    for (int i = threadIdx.x * 8; i < vec_cols; i += kBlock * 8) {
         unsigned long long t_act = 0;
         if (debug_fine) t_act = clock64();
         float gate0 = __bfloat162float(gate[i]);
         float gate1 = __bfloat162float(gate[i + 1]);
         float gate2 = __bfloat162float(gate[i + 2]);
         float gate3 = __bfloat162float(gate[i + 3]);
+        float gate4 = __bfloat162float(gate[i + 4]);
+        float gate5 = __bfloat162float(gate[i + 5]);
+        float gate6 = __bfloat162float(gate[i + 6]);
+        float gate7 = __bfloat162float(gate[i + 7]);
         float up0 = __bfloat162float(up[i]);
         float up1 = __bfloat162float(up[i + 1]);
         float up2 = __bfloat162float(up[i + 2]);
         float up3 = __bfloat162float(up[i + 3]);
-        float silu0 = gate0 / (1.0f + expf(-gate0));
-        float silu1 = gate1 / (1.0f + expf(-gate1));
-        float silu2 = gate2 / (1.0f + expf(-gate2));
-        float silu3 = gate3 / (1.0f + expf(-gate3));
+        float up4 = __bfloat162float(up[i + 4]);
+        float up5 = __bfloat162float(up[i + 5]);
+        float up6 = __bfloat162float(up[i + 6]);
+        float up7 = __bfloat162float(up[i + 7]);
+        float silu0 = split_silu_value<FAST_EXP>(gate0);
+        float silu1 = split_silu_value<FAST_EXP>(gate1);
+        float silu2 = split_silu_value<FAST_EXP>(gate2);
+        float silu3 = split_silu_value<FAST_EXP>(gate3);
+        float silu4 = split_silu_value<FAST_EXP>(gate4);
+        float silu5 = split_silu_value<FAST_EXP>(gate5);
+        float silu6 = split_silu_value<FAST_EXP>(gate6);
+        float silu7 = split_silu_value<FAST_EXP>(gate7);
         float act0 = silu0 * up0;
         float act1 = silu1 * up1;
         float act2 = silu2 * up2;
         float act3 = silu3 * up3;
+        float act4 = silu4 * up4;
+        float act5 = silu5 * up5;
+        float act6 = silu6 * up6;
+        float act7 = silu7 * up7;
         if (debug_fine) local_act_cycles += (clock64() - t_act);
 
         unsigned long long t_deq = 0;
         if (debug_fine) t_deq = clock64();
         int64_t linear = row_base + (int64_t)i;
-        const uint16_t* pack_ptr = reinterpret_cast<const uint16_t*>(down_packed_w4 + (linear >> 1));
-        SplitW4x4Pack qw = split_decode_w4x4(split_load_u16(pack_ptr));
+        const uint32_t* pack_ptr = reinterpret_cast<const uint32_t*>(down_packed_w4 + (linear >> 1));
+        SplitW4x8Pack qw = split_decode_w4x8(split_load_u32(pack_ptr));
         float scale = down_scales[linear >> 6];
         float w0 = down_codebook[qw.q0] * scale;
         float w1 = down_codebook[qw.q1] * scale;
         float w2 = down_codebook[qw.q2] * scale;
         float w3 = down_codebook[qw.q3] * scale;
+        float w4 = down_codebook[qw.q4] * scale;
+        float w5 = down_codebook[qw.q5] * scale;
+        float w6 = down_codebook[qw.q6] * scale;
+        float w7 = down_codebook[qw.q7] * scale;
         if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
 
         unsigned long long t_fma = 0;
         if (debug_fine) t_fma = clock64();
-        local_sum += act0 * w0 + act1 * w1 + act2 * w2 + act3 * w3;
+        local_sum += act0 * w0 + act1 * w1 + act2 * w2 + act3 * w3 +
+                     act4 * w4 + act5 * w5 + act6 * w6 + act7 * w7;
         if (debug_fine) local_fma_cycles += (clock64() - t_fma);
     }
     for (int i = vec_cols + threadIdx.x; i < INTERMEDIATE_SIZE; i += kBlock) {
@@ -3231,7 +3268,7 @@ __global__ void split_w4_silu_downproj_residual_kernel(
         if (debug_fine) t_act = clock64();
         float gate_v = __bfloat162float(gate[i]);
         float up_v = __bfloat162float(up[i]);
-        float silu_v = gate_v / (1.0f + expf(-gate_v));
+        float silu_v = split_silu_value<FAST_EXP>(gate_v);
         float act_v = silu_v * up_v;
         if (debug_fine) local_act_cycles += (clock64() - t_act);
 
@@ -3259,6 +3296,153 @@ __global__ void split_w4_silu_downproj_residual_kernel(
         float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
         sum = warp_reduce_sum(sum);
         if (lane_id == 0) hidden_f32[out_idx] = sum + residual_f32[out_idx];
+    }
+    if (debug_fine) {
+        atomicAdd(&fine_debug->down_dequant_cycles, local_dequant_cycles);
+        atomicAdd(&fine_debug->down_act_cycles, local_act_cycles);
+        atomicAdd(&fine_debug->down_fma_cycles, local_fma_cycles);
+    }
+}
+
+template <bool FAST_EXP, int ROW_TILE>
+__global__ void split_w4_silu_downproj_residual_rowtile_kernel_t(
+    const __nv_bfloat16* __restrict__ gateup_out_bf16,
+    const uint8_t* __restrict__ down_packed_w4,
+    const float* __restrict__ down_scales,
+    const float* __restrict__ down_codebook,
+    const float* __restrict__ residual_f32,
+    float* __restrict__ hidden_f32,
+    SplitFfnW4FineDebugRec* __restrict__ fine_debug
+) {
+    int out_base = (int)blockIdx.x * ROW_TILE;
+    if (out_base >= HIDDEN_SIZE) return;
+
+    constexpr int kBlock = 256;
+    constexpr int kWarps = kBlock / WARP_SIZE;
+    __shared__ float smem_reduce[ROW_TILE][kWarps];
+
+    const __nv_bfloat16* gate = gateup_out_bf16;
+    const __nv_bfloat16* up = gateup_out_bf16 + INTERMEDIATE_SIZE;
+    bool debug_fine = (fine_debug != nullptr);
+    unsigned long long local_dequant_cycles = 0;
+    unsigned long long local_act_cycles = 0;
+    unsigned long long local_fma_cycles = 0;
+
+    float local_sum[ROW_TILE];
+#pragma unroll
+    for (int r = 0; r < ROW_TILE; ++r) local_sum[r] = 0.0f;
+
+    int vec_cols = INTERMEDIATE_SIZE & ~7;
+    for (int i = threadIdx.x * 8; i < vec_cols; i += kBlock * 8) {
+        unsigned long long t_act = 0;
+        if (debug_fine) t_act = clock64();
+        float gate0 = __bfloat162float(gate[i]);
+        float gate1 = __bfloat162float(gate[i + 1]);
+        float gate2 = __bfloat162float(gate[i + 2]);
+        float gate3 = __bfloat162float(gate[i + 3]);
+        float gate4 = __bfloat162float(gate[i + 4]);
+        float gate5 = __bfloat162float(gate[i + 5]);
+        float gate6 = __bfloat162float(gate[i + 6]);
+        float gate7 = __bfloat162float(gate[i + 7]);
+        float up0 = __bfloat162float(up[i]);
+        float up1 = __bfloat162float(up[i + 1]);
+        float up2 = __bfloat162float(up[i + 2]);
+        float up3 = __bfloat162float(up[i + 3]);
+        float up4 = __bfloat162float(up[i + 4]);
+        float up5 = __bfloat162float(up[i + 5]);
+        float up6 = __bfloat162float(up[i + 6]);
+        float up7 = __bfloat162float(up[i + 7]);
+        float silu0 = split_silu_value<FAST_EXP>(gate0);
+        float silu1 = split_silu_value<FAST_EXP>(gate1);
+        float silu2 = split_silu_value<FAST_EXP>(gate2);
+        float silu3 = split_silu_value<FAST_EXP>(gate3);
+        float silu4 = split_silu_value<FAST_EXP>(gate4);
+        float silu5 = split_silu_value<FAST_EXP>(gate5);
+        float silu6 = split_silu_value<FAST_EXP>(gate6);
+        float silu7 = split_silu_value<FAST_EXP>(gate7);
+        float act0 = silu0 * up0;
+        float act1 = silu1 * up1;
+        float act2 = silu2 * up2;
+        float act3 = silu3 * up3;
+        float act4 = silu4 * up4;
+        float act5 = silu5 * up5;
+        float act6 = silu6 * up6;
+        float act7 = silu7 * up7;
+        if (debug_fine) local_act_cycles += (clock64() - t_act);
+
+#pragma unroll
+        for (int r = 0; r < ROW_TILE; ++r) {
+            int out_idx = out_base + r;
+            if (out_idx >= HIDDEN_SIZE) continue;
+            unsigned long long t_deq = 0;
+            if (debug_fine) t_deq = clock64();
+            int64_t linear = (int64_t)out_idx * (int64_t)INTERMEDIATE_SIZE + (int64_t)i;
+            const uint32_t* pack_ptr = reinterpret_cast<const uint32_t*>(down_packed_w4 + (linear >> 1));
+            SplitW4x8Pack qw = split_decode_w4x8(split_load_u32(pack_ptr));
+            float scale = down_scales[linear >> 6];
+            float w0 = down_codebook[qw.q0] * scale;
+            float w1 = down_codebook[qw.q1] * scale;
+            float w2 = down_codebook[qw.q2] * scale;
+            float w3 = down_codebook[qw.q3] * scale;
+            float w4 = down_codebook[qw.q4] * scale;
+            float w5 = down_codebook[qw.q5] * scale;
+            float w6 = down_codebook[qw.q6] * scale;
+            float w7 = down_codebook[qw.q7] * scale;
+            if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+            unsigned long long t_fma = 0;
+            if (debug_fine) t_fma = clock64();
+            local_sum[r] += act0 * w0 + act1 * w1 + act2 * w2 + act3 * w3 +
+                            act4 * w4 + act5 * w5 + act6 * w6 + act7 * w7;
+            if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+        }
+    }
+    for (int i = vec_cols + threadIdx.x; i < INTERMEDIATE_SIZE; i += kBlock) {
+        unsigned long long t_act = 0;
+        if (debug_fine) t_act = clock64();
+        float gate_v = __bfloat162float(gate[i]);
+        float up_v = __bfloat162float(up[i]);
+        float silu_v = split_silu_value<FAST_EXP>(gate_v);
+        float act_v = silu_v * up_v;
+        if (debug_fine) local_act_cycles += (clock64() - t_act);
+
+#pragma unroll
+        for (int r = 0; r < ROW_TILE; ++r) {
+            int out_idx = out_base + r;
+            if (out_idx >= HIDDEN_SIZE) continue;
+            unsigned long long t_deq = 0;
+            if (debug_fine) t_deq = clock64();
+            int64_t linear = (int64_t)out_idx * (int64_t)INTERMEDIATE_SIZE + (int64_t)i;
+            uint8_t pack = down_packed_w4[linear >> 1];
+            int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
+            float down_w = down_codebook[q] * down_scales[linear >> 6];
+            if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+            unsigned long long t_fma = 0;
+            if (debug_fine) t_fma = clock64();
+            local_sum[r] += act_v * down_w;
+            if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+        }
+    }
+
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+#pragma unroll
+    for (int r = 0; r < ROW_TILE; ++r) {
+        float sum_r = warp_reduce_sum(local_sum[r]);
+        if (lane_id == 0) smem_reduce[r][warp_id] = sum_r;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+#pragma unroll
+        for (int r = 0; r < ROW_TILE; ++r) {
+            int out_idx = out_base + r;
+            if (out_idx >= HIDDEN_SIZE) continue;
+            float sum = (lane_id < kWarps) ? smem_reduce[r][lane_id] : 0.0f;
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0) hidden_f32[out_idx] = sum + residual_f32[out_idx];
+        }
     }
     if (debug_fine) {
         atomicAdd(&fine_debug->down_dequant_cycles, local_dequant_cycles);

@@ -1839,16 +1839,76 @@ extern "C" void launch_split_decode_gemm(
         bool down_try_lt = false;
         bool down_use_gemv = false;
         bool down_w4_done = false;
+        bool down_w4_fast_exp = _split_down_w4_fast_exp_enabled();
+        int down_w4_row_tile = _split_down_w4_row_tile();
         if (ffn_w4_fused_silu_down) {
-            split_w4_silu_downproj_residual_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
-                (const __nv_bfloat16*)gateup_out_bf16,
-                down_w4_packed,
-                down_w4_scales,
-                down_w4_codebook,
-                (const float*)residual_f32,
-                (float*)hidden_f32,
-                debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
-            );
+            int grid_rows = (down_w4_row_tile == 4) ? ((HIDDEN_SIZE + 3) / 4)
+                                                     : ((down_w4_row_tile == 2) ? ((HIDDEN_SIZE + 1) / 2) : HIDDEN_SIZE);
+            if (down_w4_fast_exp) {
+                if (down_w4_row_tile == 4) {
+                    split_w4_silu_downproj_residual_rowtile_kernel_t<true, 4><<<grid_rows, 256, 0, stream>>>(
+                        (const __nv_bfloat16*)gateup_out_bf16,
+                        down_w4_packed,
+                        down_w4_scales,
+                        down_w4_codebook,
+                        (const float*)residual_f32,
+                        (float*)hidden_f32,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else if (down_w4_row_tile == 2) {
+                    split_w4_silu_downproj_residual_rowtile_kernel_t<true, 2><<<grid_rows, 256, 0, stream>>>(
+                        (const __nv_bfloat16*)gateup_out_bf16,
+                        down_w4_packed,
+                        down_w4_scales,
+                        down_w4_codebook,
+                        (const float*)residual_f32,
+                        (float*)hidden_f32,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else {
+                    split_w4_silu_downproj_residual_kernel_t<true><<<HIDDEN_SIZE, 256, 0, stream>>>(
+                        (const __nv_bfloat16*)gateup_out_bf16,
+                        down_w4_packed,
+                        down_w4_scales,
+                        down_w4_codebook,
+                        (const float*)residual_f32,
+                        (float*)hidden_f32,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                }
+            } else {
+                if (down_w4_row_tile == 4) {
+                    split_w4_silu_downproj_residual_rowtile_kernel_t<false, 4><<<grid_rows, 256, 0, stream>>>(
+                        (const __nv_bfloat16*)gateup_out_bf16,
+                        down_w4_packed,
+                        down_w4_scales,
+                        down_w4_codebook,
+                        (const float*)residual_f32,
+                        (float*)hidden_f32,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else if (down_w4_row_tile == 2) {
+                    split_w4_silu_downproj_residual_rowtile_kernel_t<false, 2><<<grid_rows, 256, 0, stream>>>(
+                        (const __nv_bfloat16*)gateup_out_bf16,
+                        down_w4_packed,
+                        down_w4_scales,
+                        down_w4_codebook,
+                        (const float*)residual_f32,
+                        (float*)hidden_f32,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else {
+                    split_w4_silu_downproj_residual_kernel_t<false><<<HIDDEN_SIZE, 256, 0, stream>>>(
+                        (const __nv_bfloat16*)gateup_out_bf16,
+                        down_w4_packed,
+                        down_w4_scales,
+                        down_w4_codebook,
+                        (const float*)residual_f32,
+                        (float*)hidden_f32,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                }
+            }
             down_done = true;
             down_w4_done = true;
             if (debug_stage_avg) {
