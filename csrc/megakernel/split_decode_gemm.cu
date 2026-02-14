@@ -114,6 +114,24 @@ struct SplitHalf2x2Pack {
     __half2 h23;
 };
 
+struct SplitW4x4Pack {
+    int q0;
+    int q1;
+    int q2;
+    int q3;
+};
+
+struct SplitW4x8Pack {
+    int q0;
+    int q1;
+    int q2;
+    int q3;
+    int q4;
+    int q5;
+    int q6;
+    int q7;
+};
+
 __device__ __forceinline__ SplitFp8x4Pack split_load_fp8x4(
     const __nv_fp8_e4m3* __restrict__ ptr
 ) {
@@ -138,6 +156,58 @@ __device__ __forceinline__ SplitHalf2x2Pack split_fp8x4_to_half2x2(
         __NV_E4M3);
     out.h01 = __halves2half2(__ushort_as_half(raw01.x), __ushort_as_half(raw01.y));
     out.h23 = __halves2half2(__ushort_as_half(raw23.x), __ushort_as_half(raw23.y));
+    return out;
+}
+
+__device__ __forceinline__ uint16_t split_load_u16(
+    const uint16_t* __restrict__ ptr
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
+    return __ldg(ptr);
+#else
+    return *ptr;
+#endif
+}
+
+__device__ __forceinline__ uint32_t split_load_u32(
+    const uint32_t* __restrict__ ptr
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
+    return __ldg(ptr);
+#else
+    return *ptr;
+#endif
+}
+
+__device__ __forceinline__ SplitW4x4Pack split_decode_w4x4(
+    uint16_t packed2
+) {
+    uint8_t p0 = static_cast<uint8_t>(packed2 & 0x00FFu);
+    uint8_t p1 = static_cast<uint8_t>(packed2 >> 8U);
+    SplitW4x4Pack out;
+    out.q0 = int((p0 >> 4) & 0x0F);
+    out.q1 = int(p0 & 0x0F);
+    out.q2 = int((p1 >> 4) & 0x0F);
+    out.q3 = int(p1 & 0x0F);
+    return out;
+}
+
+__device__ __forceinline__ SplitW4x8Pack split_decode_w4x8(
+    uint32_t packed4
+) {
+    uint8_t p0 = static_cast<uint8_t>(packed4 & 0x000000FFu);
+    uint8_t p1 = static_cast<uint8_t>((packed4 >> 8U) & 0xFFu);
+    uint8_t p2 = static_cast<uint8_t>((packed4 >> 16U) & 0xFFu);
+    uint8_t p3 = static_cast<uint8_t>((packed4 >> 24U) & 0xFFu);
+    SplitW4x8Pack out;
+    out.q0 = int((p0 >> 4) & 0x0F);
+    out.q1 = int(p0 & 0x0F);
+    out.q2 = int((p1 >> 4) & 0x0F);
+    out.q3 = int(p1 & 0x0F);
+    out.q4 = int((p2 >> 4) & 0x0F);
+    out.q5 = int(p2 & 0x0F);
+    out.q6 = int((p3 >> 4) & 0x0F);
+    out.q7 = int(p3 & 0x0F);
     return out;
 }
 
@@ -856,6 +926,15 @@ struct SplitFlashDecodeDebugRec {
     int block_switches;
     int oob_skips;
     int tiles_processed;
+};
+
+struct SplitFfnW4FineDebugRec {
+    unsigned long long gateup_dequant_cycles;
+    unsigned long long gateup_fma_cycles;
+    unsigned long long gateup_reduce_cycles;
+    unsigned long long down_dequant_cycles;
+    unsigned long long down_act_cycles;
+    unsigned long long down_fma_cycles;
 };
 
 // Flash-decode v2 phase-1:
@@ -2738,34 +2817,84 @@ __global__ void split_silu_downproj_residual_fused_kernel(
 // - packed_w4: 2 int4 values per byte, row-major over [rows, cols]
 // - scales: per-64-element block scale (linear indexing)
 // - codebook: 16-entry dequant table
-__global__ void split_w4_matvec_bf16_out_kernel(
+template <int kBlock>
+__global__ void split_w4_matvec_bf16_out_kernel_t(
     const uint8_t* __restrict__ packed_w4,
     const float* __restrict__ scales,
     const float* __restrict__ codebook,
     const __nv_bfloat16* __restrict__ x_bf16,
     __nv_bfloat16* __restrict__ y_bf16,
     int rows,
-    int cols
+    int cols,
+    SplitFfnW4FineDebugRec* __restrict__ fine_debug
 ) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
 
-    constexpr int kBlock = 256;
+    static_assert(kBlock % WARP_SIZE == 0, "kBlock must be multiple of warp size.");
     constexpr int kWarps = kBlock / WARP_SIZE;
     __shared__ float smem_reduce[kWarps];
     int codebook_base = (rows == (INTERMEDIATE_SIZE + INTERMEDIATE_SIZE) && row >= INTERMEDIATE_SIZE) ? 16 : 0;
+    const float* __restrict__ codebook_row = codebook + codebook_base;
+    bool debug_fine = (fine_debug != nullptr);
+    unsigned long long local_dequant_cycles = 0;
+    unsigned long long local_fma_cycles = 0;
+    unsigned long long local_reduce_cycles = 0;
 
     float local_sum = 0.0f;
     int64_t row_base = (int64_t)row * (int64_t)cols;
-    for (int col = threadIdx.x; col < cols; col += kBlock) {
+    int vec_cols = cols & ~7;
+    for (int col = threadIdx.x * 8; col < vec_cols; col += kBlock * 8) {
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
+        int64_t linear = row_base + (int64_t)col;
+        const uint32_t* pack_ptr = reinterpret_cast<const uint32_t*>(packed_w4 + (linear >> 1));
+        SplitW4x8Pack qw = split_decode_w4x8(split_load_u32(pack_ptr));
+        int scale_idx = int(linear >> 6);
+        float scale = scales[scale_idx];
+        float w0 = codebook_row[qw.q0] * scale;
+        float w1 = codebook_row[qw.q1] * scale;
+        float w2 = codebook_row[qw.q2] * scale;
+        float w3 = codebook_row[qw.q3] * scale;
+        float w4 = codebook_row[qw.q4] * scale;
+        float w5 = codebook_row[qw.q5] * scale;
+        float w6 = codebook_row[qw.q6] * scale;
+        float w7 = codebook_row[qw.q7] * scale;
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
+        float x0 = __bfloat162float(x_bf16[col]);
+        float x1 = __bfloat162float(x_bf16[col + 1]);
+        float x2 = __bfloat162float(x_bf16[col + 2]);
+        float x3 = __bfloat162float(x_bf16[col + 3]);
+        float x4 = __bfloat162float(x_bf16[col + 4]);
+        float x5 = __bfloat162float(x_bf16[col + 5]);
+        float x6 = __bfloat162float(x_bf16[col + 6]);
+        float x7 = __bfloat162float(x_bf16[col + 7]);
+
+        local_sum += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3 +
+                     w4 * x4 + w5 * x5 + w6 * x6 + w7 * x7;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+    }
+    for (int col = vec_cols + threadIdx.x; col < cols; col += kBlock) {
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
         int64_t linear = row_base + (int64_t)col;
         uint8_t pack = packed_w4[linear >> 1];
         int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
-        float w = codebook[codebook_base + q] * scales[linear >> 6];
+        int scale_idx = int(linear >> 6);
+        float w = codebook_row[q] * scales[scale_idx];
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
         float xv = __bfloat162float(x_bf16[col]);
         local_sum += w * xv;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
     }
 
+    unsigned long long t_reduce = 0;
+    if (debug_fine) t_reduce = clock64();
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
     local_sum = warp_reduce_sum(local_sum);
@@ -2776,6 +2905,101 @@ __global__ void split_w4_matvec_bf16_out_kernel(
         float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
         sum = warp_reduce_sum(sum);
         if (lane_id == 0) y_bf16[row] = __float2bfloat16(sum);
+    }
+    if (debug_fine) {
+        local_reduce_cycles += (clock64() - t_reduce);
+        atomicAdd(&fine_debug->gateup_dequant_cycles, local_dequant_cycles);
+        atomicAdd(&fine_debug->gateup_fma_cycles, local_fma_cycles);
+        atomicAdd(&fine_debug->gateup_reduce_cycles, local_reduce_cycles);
+    }
+}
+
+template <int kBlock>
+__global__ void split_w4_matvec_warp_per_row_kernel_t(
+    const uint8_t* __restrict__ packed_w4,
+    const float* __restrict__ scales,
+    const float* __restrict__ codebook,
+    const __nv_bfloat16* __restrict__ x_bf16,
+    __nv_bfloat16* __restrict__ y_bf16,
+    int rows,
+    int cols,
+    SplitFfnW4FineDebugRec* __restrict__ fine_debug
+) {
+    static_assert(kBlock % WARP_SIZE == 0, "kBlock must be multiple of warp size.");
+    constexpr int kWarpsPerBlock = kBlock / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int row = (int)blockIdx.x * kWarpsPerBlock + warp_id;
+    if (row >= rows) return;
+
+    int codebook_base = (rows == (INTERMEDIATE_SIZE + INTERMEDIATE_SIZE) && row >= INTERMEDIATE_SIZE) ? 16 : 0;
+    const float* __restrict__ codebook_row = codebook + codebook_base;
+    bool debug_fine = (fine_debug != nullptr);
+    unsigned long long local_dequant_cycles = 0;
+    unsigned long long local_fma_cycles = 0;
+    unsigned long long local_reduce_cycles = 0;
+
+    float local_sum = 0.0f;
+    int64_t row_base = (int64_t)row * (int64_t)cols;
+    int vec_cols = cols & ~7;
+    for (int col = lane_id * 8; col < vec_cols; col += WARP_SIZE * 8) {
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
+        int64_t linear = row_base + (int64_t)col;
+        const uint32_t* pack_ptr = reinterpret_cast<const uint32_t*>(packed_w4 + (linear >> 1));
+        SplitW4x8Pack qw = split_decode_w4x8(split_load_u32(pack_ptr));
+        float scale = scales[linear >> 6];
+        float w0 = codebook_row[qw.q0] * scale;
+        float w1 = codebook_row[qw.q1] * scale;
+        float w2 = codebook_row[qw.q2] * scale;
+        float w3 = codebook_row[qw.q3] * scale;
+        float w4 = codebook_row[qw.q4] * scale;
+        float w5 = codebook_row[qw.q5] * scale;
+        float w6 = codebook_row[qw.q6] * scale;
+        float w7 = codebook_row[qw.q7] * scale;
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
+        float x0 = __bfloat162float(x_bf16[col]);
+        float x1 = __bfloat162float(x_bf16[col + 1]);
+        float x2 = __bfloat162float(x_bf16[col + 2]);
+        float x3 = __bfloat162float(x_bf16[col + 3]);
+        float x4 = __bfloat162float(x_bf16[col + 4]);
+        float x5 = __bfloat162float(x_bf16[col + 5]);
+        float x6 = __bfloat162float(x_bf16[col + 6]);
+        float x7 = __bfloat162float(x_bf16[col + 7]);
+        local_sum += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3 +
+                     w4 * x4 + w5 * x5 + w6 * x6 + w7 * x7;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+    }
+    for (int col = vec_cols + lane_id; col < cols; col += WARP_SIZE) {
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
+        int64_t linear = row_base + (int64_t)col;
+        uint8_t pack = packed_w4[linear >> 1];
+        int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
+        float w = codebook_row[q] * scales[linear >> 6];
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
+        float xv = __bfloat162float(x_bf16[col]);
+        local_sum += w * xv;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+    }
+
+    unsigned long long t_reduce = 0;
+    if (debug_fine) t_reduce = clock64();
+    local_sum = warp_reduce_sum(local_sum);
+    if (lane_id == 0) {
+        y_bf16[row] = __float2bfloat16(local_sum);
+    }
+    if (debug_fine) {
+        local_reduce_cycles += (clock64() - t_reduce);
+        atomicAdd(&fine_debug->gateup_dequant_cycles, local_dequant_cycles);
+        atomicAdd(&fine_debug->gateup_fma_cycles, local_fma_cycles);
+        atomicAdd(&fine_debug->gateup_reduce_cycles, local_reduce_cycles);
     }
 }
 
@@ -2823,7 +3047,24 @@ __global__ void split_w4_qkv_matvec_bf16_out_kernel(
 
     float local_sum = 0.0f;
     int64_t row_base = (int64_t)local_row * (int64_t)cols;
-    for (int col = threadIdx.x; col < cols; col += kBlock) {
+    int vec_cols = cols & ~3;
+    for (int col = threadIdx.x * 4; col < vec_cols; col += kBlock * 4) {
+        int64_t linear = row_base + (int64_t)col;
+        const uint16_t* pack_ptr = reinterpret_cast<const uint16_t*>(packed_w4 + (linear >> 1));
+        SplitW4x4Pack qw = split_decode_w4x4(split_load_u16(pack_ptr));
+        float scale = scales[linear >> 6];
+
+        float x0 = __bfloat162float(x_bf16[col]);
+        float x1 = __bfloat162float(x_bf16[col + 1]);
+        float x2 = __bfloat162float(x_bf16[col + 2]);
+        float x3 = __bfloat162float(x_bf16[col + 3]);
+        float dot4 = codebook[qw.q0] * x0 +
+                     codebook[qw.q1] * x1 +
+                     codebook[qw.q2] * x2 +
+                     codebook[qw.q3] * x3;
+        local_sum += dot4 * scale;
+    }
+    for (int col = vec_cols + threadIdx.x; col < cols; col += kBlock) {
         int64_t linear = row_base + (int64_t)col;
         uint8_t pack = packed_w4[linear >> 1];
         int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
@@ -2851,7 +3092,8 @@ __global__ void split_w4_downproj_residual_kernel(
     const float* __restrict__ codebook,
     const __nv_bfloat16* __restrict__ x_bf16,   // [INTERMEDIATE_SIZE]
     const float* __restrict__ residual_f32,      // [HIDDEN_SIZE]
-    float* __restrict__ hidden_f32               // [HIDDEN_SIZE]
+    float* __restrict__ hidden_f32,              // [HIDDEN_SIZE]
+    SplitFfnW4FineDebugRec* __restrict__ fine_debug
 ) {
     int row = (int)blockIdx.x;
     if (row >= HIDDEN_SIZE) return;
@@ -2859,16 +3101,48 @@ __global__ void split_w4_downproj_residual_kernel(
     constexpr int kBlock = 256;
     constexpr int kWarps = kBlock / WARP_SIZE;
     __shared__ float smem_reduce[kWarps];
+    bool debug_fine = (fine_debug != nullptr);
+    unsigned long long local_dequant_cycles = 0;
+    unsigned long long local_fma_cycles = 0;
 
     float local_sum = 0.0f;
     int64_t row_base = (int64_t)row * (int64_t)INTERMEDIATE_SIZE;
-    for (int col = threadIdx.x; col < INTERMEDIATE_SIZE; col += kBlock) {
+    int vec_cols = INTERMEDIATE_SIZE & ~3;
+    for (int col = threadIdx.x * 4; col < vec_cols; col += kBlock * 4) {
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
+        int64_t linear = row_base + (int64_t)col;
+        const uint16_t* pack_ptr = reinterpret_cast<const uint16_t*>(packed_w4 + (linear >> 1));
+        SplitW4x4Pack qw = split_decode_w4x4(split_load_u16(pack_ptr));
+        float scale = scales[linear >> 6];
+        float w0 = codebook[qw.q0] * scale;
+        float w1 = codebook[qw.q1] * scale;
+        float w2 = codebook[qw.q2] * scale;
+        float w3 = codebook[qw.q3] * scale;
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
+        float x0 = __bfloat162float(x_bf16[col]);
+        float x1 = __bfloat162float(x_bf16[col + 1]);
+        float x2 = __bfloat162float(x_bf16[col + 2]);
+        float x3 = __bfloat162float(x_bf16[col + 3]);
+        local_sum += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+    }
+    for (int col = vec_cols + threadIdx.x; col < INTERMEDIATE_SIZE; col += kBlock) {
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
         int64_t linear = row_base + (int64_t)col;
         uint8_t pack = packed_w4[linear >> 1];
         int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
         float w = codebook[q] * scales[linear >> 6];
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
         float xv = __bfloat162float(x_bf16[col]);
         local_sum += w * xv;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
     }
 
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -2882,6 +3156,10 @@ __global__ void split_w4_downproj_residual_kernel(
         sum = warp_reduce_sum(sum);
         if (lane_id == 0) hidden_f32[row] = sum + residual_f32[row];
     }
+    if (debug_fine) {
+        atomicAdd(&fine_debug->down_dequant_cycles, local_dequant_cycles);
+        atomicAdd(&fine_debug->down_fma_cycles, local_fma_cycles);
+    }
 }
 
 __global__ void split_w4_silu_downproj_residual_kernel(
@@ -2890,7 +3168,8 @@ __global__ void split_w4_silu_downproj_residual_kernel(
     const float* __restrict__ down_scales,              // [HIDDEN_SIZE * INTERMEDIATE_SIZE / 64]
     const float* __restrict__ down_codebook,            // [16]
     const float* __restrict__ residual_f32,             // [HIDDEN_SIZE]
-    float* __restrict__ hidden_f32                      // [HIDDEN_SIZE]
+    float* __restrict__ hidden_f32,                     // [HIDDEN_SIZE]
+    SplitFfnW4FineDebugRec* __restrict__ fine_debug
 ) {
     int out_idx = (int)blockIdx.x;
     if (out_idx >= HIDDEN_SIZE) return;
@@ -2901,20 +3180,73 @@ __global__ void split_w4_silu_downproj_residual_kernel(
 
     const __nv_bfloat16* gate = gateup_out_bf16;
     const __nv_bfloat16* up = gateup_out_bf16 + INTERMEDIATE_SIZE;
+    bool debug_fine = (fine_debug != nullptr);
+    unsigned long long local_dequant_cycles = 0;
+    unsigned long long local_act_cycles = 0;
+    unsigned long long local_fma_cycles = 0;
 
     float local_sum = 0.0f;
     int64_t row_base = (int64_t)out_idx * (int64_t)INTERMEDIATE_SIZE;
-    for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += kBlock) {
+    int vec_cols = INTERMEDIATE_SIZE & ~3;
+    for (int i = threadIdx.x * 4; i < vec_cols; i += kBlock * 4) {
+        unsigned long long t_act = 0;
+        if (debug_fine) t_act = clock64();
+        float gate0 = __bfloat162float(gate[i]);
+        float gate1 = __bfloat162float(gate[i + 1]);
+        float gate2 = __bfloat162float(gate[i + 2]);
+        float gate3 = __bfloat162float(gate[i + 3]);
+        float up0 = __bfloat162float(up[i]);
+        float up1 = __bfloat162float(up[i + 1]);
+        float up2 = __bfloat162float(up[i + 2]);
+        float up3 = __bfloat162float(up[i + 3]);
+        float silu0 = gate0 / (1.0f + expf(-gate0));
+        float silu1 = gate1 / (1.0f + expf(-gate1));
+        float silu2 = gate2 / (1.0f + expf(-gate2));
+        float silu3 = gate3 / (1.0f + expf(-gate3));
+        float act0 = silu0 * up0;
+        float act1 = silu1 * up1;
+        float act2 = silu2 * up2;
+        float act3 = silu3 * up3;
+        if (debug_fine) local_act_cycles += (clock64() - t_act);
+
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
+        int64_t linear = row_base + (int64_t)i;
+        const uint16_t* pack_ptr = reinterpret_cast<const uint16_t*>(down_packed_w4 + (linear >> 1));
+        SplitW4x4Pack qw = split_decode_w4x4(split_load_u16(pack_ptr));
+        float scale = down_scales[linear >> 6];
+        float w0 = down_codebook[qw.q0] * scale;
+        float w1 = down_codebook[qw.q1] * scale;
+        float w2 = down_codebook[qw.q2] * scale;
+        float w3 = down_codebook[qw.q3] * scale;
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
+
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
+        local_sum += act0 * w0 + act1 * w1 + act2 * w2 + act3 * w3;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
+    }
+    for (int i = vec_cols + threadIdx.x; i < INTERMEDIATE_SIZE; i += kBlock) {
+        unsigned long long t_act = 0;
+        if (debug_fine) t_act = clock64();
         float gate_v = __bfloat162float(gate[i]);
         float up_v = __bfloat162float(up[i]);
         float silu_v = gate_v / (1.0f + expf(-gate_v));
+        float act_v = silu_v * up_v;
+        if (debug_fine) local_act_cycles += (clock64() - t_act);
 
+        unsigned long long t_deq = 0;
+        if (debug_fine) t_deq = clock64();
         int64_t linear = row_base + (int64_t)i;
         uint8_t pack = down_packed_w4[linear >> 1];
         int q = (linear & 1) ? int(pack & 0x0F) : int((pack >> 4) & 0x0F);
         float down_w = down_codebook[q] * down_scales[linear >> 6];
+        if (debug_fine) local_dequant_cycles += (clock64() - t_deq);
 
-        local_sum += (silu_v * up_v) * down_w;
+        unsigned long long t_fma = 0;
+        if (debug_fine) t_fma = clock64();
+        local_sum += act_v * down_w;
+        if (debug_fine) local_fma_cycles += (clock64() - t_fma);
     }
 
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -2927,6 +3259,11 @@ __global__ void split_w4_silu_downproj_residual_kernel(
         float sum = (lane_id < kWarps) ? smem_reduce[lane_id] : 0.0f;
         sum = warp_reduce_sum(sum);
         if (lane_id == 0) hidden_f32[out_idx] = sum + residual_f32[out_idx];
+    }
+    if (debug_fine) {
+        atomicAdd(&fine_debug->down_dequant_cycles, local_dequant_cycles);
+        atomicAdd(&fine_debug->down_act_cycles, local_act_cycles);
+        atomicAdd(&fine_debug->down_fma_cycles, local_fma_cycles);
     }
 }
 

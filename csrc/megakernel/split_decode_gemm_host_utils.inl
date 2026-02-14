@@ -233,6 +233,42 @@ static inline bool _split_ffn_w4_fused_silu_down_enabled() {
     return mode == 1;
 }
 
+static inline int _split_gateup_w4_block_threads() {
+    static int v = -1;
+    if (v > 0) return v;
+    v = 256;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_GATEUP_W4_BLOCK");
+    if (s != nullptr && std::strcmp(s, "") != 0) {
+        int p = std::atoi(s);
+        if (p == 128 || p == 192 || p == 256) v = p;
+    }
+    return v;
+}
+
+static inline bool _split_gateup_w4_warp_row_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_SPLIT_GATEUP_W4_IMPL");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "block") == 0 ||
+        std::strcmp(s, "legacy") == 0) {
+        mode = 0;
+    } else if (std::strcmp(s, "1") == 0 ||
+               std::strcmp(s, "warp_row") == 0 ||
+               std::strcmp(s, "warp-per-row") == 0 ||
+               std::strcmp(s, "warprow") == 0) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+    return mode == 1;
+}
+
+static inline const char* _split_gateup_w4_impl_name() {
+    return _split_gateup_w4_warp_row_enabled() ? "warp_row" : "block";
+}
+
 static inline bool _split_qkv_w4_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
@@ -693,6 +729,43 @@ static inline bool _split_debug_flash_breakdown_enabled() {
     return mode == 1;
 }
 
+static inline bool _split_debug_ffn_w4_fine_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* s = std::getenv("MEGAQWEN_DEBUG_FFN_W4_FINE");
+    if (s == nullptr || std::strcmp(s, "") == 0 ||
+        std::strcmp(s, "0") == 0 ||
+        std::strcmp(s, "false") == 0 ||
+        std::strcmp(s, "False") == 0) {
+        mode = 0;
+    } else {
+        mode = 1;
+    }
+    return mode == 1;
+}
+
+static inline int _split_debug_ffn_w4_fine_tokens() {
+    static int v = -1;
+    if (v >= 0) return v;
+    v = 1;
+    const char* s = std::getenv("MEGAQWEN_DEBUG_FFN_W4_FINE_TOKENS");
+    if (s == nullptr || std::strcmp(s, "") == 0) return v;
+    if (std::strcmp(s, "all") == 0) {
+        v = 1000000000;
+        return v;
+    }
+    int p = std::atoi(s);
+    if (p >= 0) v = p;
+    return v;
+}
+
+static inline bool _split_debug_ffn_w4_fine_take_ticket() {
+    if (!_split_debug_ffn_w4_fine_enabled()) return false;
+    static long long counter = 0;
+    long long idx = counter++;
+    return idx < static_cast<long long>(_split_debug_ffn_w4_fine_tokens());
+}
+
 enum SplitStageId : int {
     SPLIT_STAGE_EMBED = 0,
     SPLIT_STAGE_RMS1 = 1,
@@ -765,6 +838,14 @@ struct SplitDebugAgg {
     long long o_w4;
     long long gateup_w4;
     long long down_w4;
+    long long ffn_w4_fine_samples;
+    long long ffn_w4_clock_khz;
+    unsigned long long gateup_dequant_cycles;
+    unsigned long long gateup_fma_cycles;
+    unsigned long long gateup_reduce_cycles;
+    unsigned long long down_dequant_cycles;
+    unsigned long long down_act_cycles;
+    unsigned long long down_fma_cycles;
 };
 
 static inline SplitDebugAgg& _split_debug_agg() {
@@ -779,104 +860,145 @@ extern "C" void split_debug_stage_reset() {
 }
 
 extern "C" void split_debug_stage_print_summary() {
-    if (!_split_debug_avg_enabled()) return;
     auto& agg = _split_debug_agg();
-    if (agg.tokens <= 0 || agg.total_ms <= 0.0) return;
+    bool stage_avg_enabled = _split_debug_avg_enabled();
+    bool has_stage_stats = (agg.tokens > 0 && agg.total_ms > 0.0);
+    bool has_ffn_fine = (agg.ffn_w4_fine_samples > 0);
+    if ((!stage_avg_enabled || !has_stage_stats) && !has_ffn_fine) return;
 
     bool sampled = (agg.sampled_tokens > 0 && agg.sampled_tokens < agg.tokens);
-    if (sampled) {
-        printf("[MEGAQWEN_DEBUG] SPLIT stage timing (sampled avg over decode tokens) tokens=%lld sampled=%lld stride=%lld\n",
-               agg.tokens, agg.sampled_tokens, (agg.sample_stride > 0 ? agg.sample_stride : 1));
-    } else {
-        printf("[MEGAQWEN_DEBUG] SPLIT stage timing (avg over all decode tokens) tokens=%lld\n", agg.tokens);
-    }
-    double denom_tokens = (agg.sampled_tokens > 0) ? double(agg.sampled_tokens) : double(agg.tokens);
-    bool paged_focus = _split_debug_paged_kv_enabled();
-    for (int s = 0; s < SPLIT_STAGE_COUNT; s++) {
-        if (paged_focus && (s == SPLIT_STAGE_GATEUP_GEMM || s == SPLIT_STAGE_DOWN_GEMM)) continue;
-        if (agg.stage_calls[s] <= 0) continue;
-        double total = agg.stage_ms[s];
-        double avg_token = total / denom_tokens;
-        double avg_call = total / double(agg.stage_calls[s]);
-        double pct = (agg.total_ms > 0.0) ? (total * 100.0 / agg.total_ms) : 0.0;
-        printf("  %-16s total=%8.3f ms  avg/token=%7.4f ms  avg/call=%7.4f ms  calls=%5lld  (%5.1f%%)\n",
-               kSplitStageNames[s], total, avg_token, avg_call, agg.stage_calls[s], pct);
-    }
-    printf("  %-16s total=%8.3f ms  avg/token=%7.4f ms\n",
-           "decode_step_sum", agg.total_ms, agg.total_ms / denom_tokens);
-    if (sampled) {
-        printf("[MEGAQWEN_DEBUG] SPLIT note: avg/token values above are sampled estimates.\n");
-    }
-    printf("[MEGAQWEN_DEBUG] SPLIT gemm route summary\n");
-    printf("  qkv    impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
-           _split_qkv_impl_name(), agg.qkv_lt_ok, agg.qkv_lt_fb, agg.qkv_gemmex);
-    printf("         gemv=%5lld\n", agg.qkv_gemv);
-    printf("  o      impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
-           _split_o_impl_name(), agg.o_lt_ok, agg.o_lt_fb, agg.o_gemmex);
-    printf("         gemv=%5lld\n", agg.o_gemv);
-    printf("  gateup impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
-           _split_gateup_impl_name(), agg.gateup_lt_ok, agg.gateup_lt_fb, agg.gateup_gemmex);
-    printf("         gemv=%5lld\n", agg.gateup_gemv);
-    printf("  down   impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
-           _split_down_impl_name(), agg.down_lt_ok, agg.down_lt_fb, agg.down_gemmex);
-    printf("         gemv=%5lld\n", agg.down_gemv);
-    printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
-           _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
-    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d k_fp8_enabled=%d flash_parts=%d flash_gqa_share=%d flash_gqa_mode=%s flash_fp8_tc_qk=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld\n",
+    double denom_tokens = (agg.sampled_tokens > 0) ? double(agg.sampled_tokens) : double((agg.tokens > 0) ? agg.tokens : 1);
+    if (stage_avg_enabled && has_stage_stats) {
+        if (sampled) {
+            printf("[MEGAQWEN_DEBUG] SPLIT stage timing (sampled avg over decode tokens) tokens=%lld sampled=%lld stride=%lld\n",
+                   agg.tokens, agg.sampled_tokens, (agg.sample_stride > 0 ? agg.sample_stride : 1));
+        } else {
+            printf("[MEGAQWEN_DEBUG] SPLIT stage timing (avg over all decode tokens) tokens=%lld\n", agg.tokens);
+        }
+        bool paged_focus = _split_debug_paged_kv_enabled();
+        for (int s = 0; s < SPLIT_STAGE_COUNT; s++) {
+            if (paged_focus && (s == SPLIT_STAGE_GATEUP_GEMM || s == SPLIT_STAGE_DOWN_GEMM)) continue;
+            if (agg.stage_calls[s] <= 0) continue;
+            double total = agg.stage_ms[s];
+            double avg_token = total / denom_tokens;
+            double avg_call = total / double(agg.stage_calls[s]);
+            double pct = (agg.total_ms > 0.0) ? (total * 100.0 / agg.total_ms) : 0.0;
+            printf("  %-16s total=%8.3f ms  avg/token=%7.4f ms  avg/call=%7.4f ms  calls=%5lld  (%5.1f%%)\n",
+                   kSplitStageNames[s], total, avg_token, avg_call, agg.stage_calls[s], pct);
+        }
+        printf("  %-16s total=%8.3f ms  avg/token=%7.4f ms\n",
+               "decode_step_sum", agg.total_ms, agg.total_ms / denom_tokens);
+        if (sampled) {
+            printf("[MEGAQWEN_DEBUG] SPLIT note: avg/token values above are sampled estimates.\n");
+        }
+        printf("[MEGAQWEN_DEBUG] SPLIT gemm route summary\n");
+        printf("  qkv    impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
+               _split_qkv_impl_name(), agg.qkv_lt_ok, agg.qkv_lt_fb, agg.qkv_gemmex);
+        printf("         gemv=%5lld\n", agg.qkv_gemv);
+        printf("  o      impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
+               _split_o_impl_name(), agg.o_lt_ok, agg.o_lt_fb, agg.o_gemmex);
+        printf("         gemv=%5lld\n", agg.o_gemv);
+        printf("  gateup impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
+               _split_gateup_impl_name(), agg.gateup_lt_ok, agg.gateup_lt_fb, agg.gateup_gemmex);
+        printf("         gemv=%5lld\n", agg.gateup_gemv);
+        printf("  down   impl=%-6s lt_ok=%5lld lt_fb=%5lld gemmex=%5lld\n",
+               _split_down_impl_name(), agg.down_lt_ok, agg.down_lt_fb, agg.down_gemmex);
+        printf("         gemv=%5lld\n", agg.down_gemv);
+        printf("  ffn    impl=%-16s down_fused_tail=%5lld down_fused_silu=%5lld down_fused_silu_w4=%5lld\n",
+               _split_ffn_impl_name(), agg.down_fused_tail, agg.down_fused_silu, agg.down_fused_silu_w4);
+    printf("         kv_layout=%s kv_block=%d kv_fp8_enabled=%d kv_fp8_only=%d k_fp8_enabled=%d flash_parts=%d flash_gqa_share=%d flash_gqa_mode=%s flash_fp8_tc_qk=%d qkv_w4_enabled=%d qkv_w4=%5lld o_w4_enabled=%d o_w4=%5lld ffn_w4_enabled=%d ffn_w4_fused=%d gateup_w4=%5lld down_w4=%5lld gateup_w4_block=%d gateup_w4_impl=%s\n",
            _split_kv_layout_paged_enabled() ? "paged" : "contiguous",
            _split_kv_block_size(),
            _split_kv_fp8_enabled() ? 1 : 0,
-           _split_kv_fp8_only_enabled() ? 1 : 0,
-           _split_k_fp8_enabled() ? 1 : 0,
-           _split_flash_parts(),
-           _split_flash_gqa_share_enabled() ? 1 : 0,
-           _split_flash_gqa_mode_name(),
-           _split_flash_fp8_tc_qk_enabled() ? 1 : 0,
-           _split_qkv_w4_enabled() ? 1 : 0,
-           agg.qkv_w4,
-           _split_o_w4_enabled() ? 1 : 0,
-           agg.o_w4,
+               _split_kv_fp8_only_enabled() ? 1 : 0,
+               _split_k_fp8_enabled() ? 1 : 0,
+               _split_flash_parts(),
+               _split_flash_gqa_share_enabled() ? 1 : 0,
+               _split_flash_gqa_mode_name(),
+               _split_flash_fp8_tc_qk_enabled() ? 1 : 0,
+               _split_qkv_w4_enabled() ? 1 : 0,
+               agg.qkv_w4,
+               _split_o_w4_enabled() ? 1 : 0,
+               agg.o_w4,
            _split_ffn_w4_enabled() ? 1 : 0,
            _split_ffn_w4_fused_silu_down_enabled() ? 1 : 0,
            agg.gateup_w4,
-           agg.down_w4);
+           agg.down_w4,
+           _split_gateup_w4_block_threads(),
+           _split_gateup_w4_impl_name());
 
-    int layer_n = (int)agg.max_layer_seen;
-    if (layer_n > SPLIT_DEBUG_MAX_LAYERS) layer_n = SPLIT_DEBUG_MAX_LAYERS;
-    if (layer_n > 0) {
-        auto print_stage_topk = [&](int stage, const char* name) {
-            struct Pair { double v; int i; };
-            Pair buf[SPLIT_DEBUG_MAX_LAYERS];
-            int n = 0;
-            for (int l = 0; l < layer_n; l++) {
-                long long calls = agg.stage_layer_calls[stage][l];
-                if (calls <= 0) continue;
-                buf[n++] = Pair{agg.stage_layer_ms[stage][l] / double(calls), l};
-            }
-            if (n <= 0) return;
-            for (int i = 0; i < n; i++) {
-                for (int j = i + 1; j < n; j++) {
-                    if (buf[j].v > buf[i].v) {
-                        Pair t = buf[i];
-                        buf[i] = buf[j];
-                        buf[j] = t;
+        int layer_n = (int)agg.max_layer_seen;
+        if (layer_n > SPLIT_DEBUG_MAX_LAYERS) layer_n = SPLIT_DEBUG_MAX_LAYERS;
+        if (layer_n > 0) {
+            auto print_stage_topk = [&](int stage, const char* name) {
+                struct Pair { double v; int i; };
+                Pair buf[SPLIT_DEBUG_MAX_LAYERS];
+                int n = 0;
+                for (int l = 0; l < layer_n; l++) {
+                    long long calls = agg.stage_layer_calls[stage][l];
+                    if (calls <= 0) continue;
+                    buf[n++] = Pair{agg.stage_layer_ms[stage][l] / double(calls), l};
+                }
+                if (n <= 0) return;
+                for (int i = 0; i < n; i++) {
+                    for (int j = i + 1; j < n; j++) {
+                        if (buf[j].v > buf[i].v) {
+                            Pair t = buf[i];
+                            buf[i] = buf[j];
+                            buf[j] = t;
+                        }
                     }
                 }
-            }
-            int topk = _split_debug_layer_topk();
-            if (topk > n) topk = n;
-            printf("[MEGAQWEN_DEBUG] SPLIT layer hotspot (%s, avg/call ms):", name);
-            for (int i = 0; i < topk; i++) {
-                printf(" L%02d=%.4f", buf[i].i, buf[i].v);
-            }
-            printf("\n");
-        };
+                int topk = _split_debug_layer_topk();
+                if (topk > n) topk = n;
+                printf("[MEGAQWEN_DEBUG] SPLIT layer hotspot (%s, avg/call ms):", name);
+                for (int i = 0; i < topk; i++) {
+                    printf(" L%02d=%.4f", buf[i].i, buf[i].v);
+                }
+                printf("\n");
+            };
 
-        print_stage_topk(SPLIT_STAGE_QKV_GEMM, "qkv_gemm");
-        print_stage_topk(SPLIT_STAGE_ATTN, "attn_cache");
-        if (!_split_debug_paged_kv_enabled()) {
-            print_stage_topk(SPLIT_STAGE_GATEUP_GEMM, "gateup_gemm");
-            print_stage_topk(SPLIT_STAGE_DOWN_GEMM, "down_gemm");
+            print_stage_topk(SPLIT_STAGE_QKV_GEMM, "qkv_gemm");
+            print_stage_topk(SPLIT_STAGE_ATTN, "attn_cache");
+            if (!_split_debug_paged_kv_enabled()) {
+                print_stage_topk(SPLIT_STAGE_GATEUP_GEMM, "gateup_gemm");
+                print_stage_topk(SPLIT_STAGE_DOWN_GEMM, "down_gemm");
+            }
+        }
+    }
+
+    if (has_ffn_fine) {
+        double denom_clock = (agg.ffn_w4_clock_khz > 0) ? (double)agg.ffn_w4_clock_khz * 1000.0 : 0.0;
+        auto to_ms = [&](unsigned long long cyc) -> double {
+            if (denom_clock <= 0.0) return 0.0;
+            return double(cyc) / denom_clock;
+        };
+        double gate_known = double(agg.gateup_dequant_cycles + agg.gateup_fma_cycles + agg.gateup_reduce_cycles);
+        double down_known = double(agg.down_dequant_cycles + agg.down_act_cycles + agg.down_fma_cycles);
+        printf("[MEGAQWEN_DEBUG] SPLIT ffn_w4 fine timing samples=%lld clock=%lld kHz\n",
+               agg.ffn_w4_fine_samples, agg.ffn_w4_clock_khz);
+        printf("  gateup_dequant=%llu/%.3fms norm=%.1f%% gateup_fma=%llu/%.3fms norm=%.1f%% gateup_reduce=%llu/%.3fms norm=%.1f%%\n",
+               (unsigned long long)agg.gateup_dequant_cycles, to_ms(agg.gateup_dequant_cycles),
+               (gate_known > 0.0) ? (100.0 * double(agg.gateup_dequant_cycles) / gate_known) : 0.0,
+               (unsigned long long)agg.gateup_fma_cycles, to_ms(agg.gateup_fma_cycles),
+               (gate_known > 0.0) ? (100.0 * double(agg.gateup_fma_cycles) / gate_known) : 0.0,
+               (unsigned long long)agg.gateup_reduce_cycles, to_ms(agg.gateup_reduce_cycles),
+               (gate_known > 0.0) ? (100.0 * double(agg.gateup_reduce_cycles) / gate_known) : 0.0);
+        printf("  down_dequant=%llu/%.3fms norm=%.1f%% down_act=%llu/%.3fms norm=%.1f%% down_fma=%llu/%.3fms norm=%.1f%%\n",
+               (unsigned long long)agg.down_dequant_cycles, to_ms(agg.down_dequant_cycles),
+               (down_known > 0.0) ? (100.0 * double(agg.down_dequant_cycles) / down_known) : 0.0,
+               (unsigned long long)agg.down_act_cycles, to_ms(agg.down_act_cycles),
+               (down_known > 0.0) ? (100.0 * double(agg.down_act_cycles) / down_known) : 0.0,
+               (unsigned long long)agg.down_fma_cycles, to_ms(agg.down_fma_cycles),
+               (down_known > 0.0) ? (100.0 * double(agg.down_fma_cycles) / down_known) : 0.0);
+        if (agg.ffn_w4_fine_samples > 0) {
+            printf("  per-token: gateup_dequant=%.4fms gateup_fma=%.4fms gateup_reduce=%.4fms down_dequant=%.4fms down_act=%.4fms down_fma=%.4fms\n",
+                   to_ms(agg.gateup_dequant_cycles) / double(agg.ffn_w4_fine_samples),
+                   to_ms(agg.gateup_fma_cycles) / double(agg.ffn_w4_fine_samples),
+                   to_ms(agg.gateup_reduce_cycles) / double(agg.ffn_w4_fine_samples),
+                   to_ms(agg.down_dequant_cycles) / double(agg.ffn_w4_fine_samples),
+                   to_ms(agg.down_act_cycles) / double(agg.ffn_w4_fine_samples),
+                   to_ms(agg.down_fma_cycles) / double(agg.ffn_w4_fine_samples));
         }
     }
 }

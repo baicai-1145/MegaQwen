@@ -145,7 +145,9 @@ extern "C" void launch_split_decode_gemm(
 
     bool debug_paged_kv = _split_debug_paged_kv_take_ticket();
     bool debug_flash_decode = _split_debug_flash_decode_take_ticket();
+    bool debug_ffn_w4_fine = _split_debug_ffn_w4_fine_take_ticket();
     int debug_flash_clock_khz = 0;
+    int debug_ffn_w4_clock_khz = 0;
     if (debug_flash_decode) {
         static int s_flash_clock_khz = -1;
         if (s_flash_clock_khz < 0) {
@@ -160,6 +162,21 @@ extern "C" void launch_split_decode_gemm(
             }
         }
         debug_flash_clock_khz = s_flash_clock_khz;
+    }
+    if (debug_ffn_w4_fine) {
+        static int s_ffn_w4_clock_khz = -1;
+        if (s_ffn_w4_clock_khz < 0) {
+            int dev = 0;
+            int khz = 0;
+            if (cudaGetDevice(&dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) == cudaSuccess &&
+                khz > 0) {
+                s_ffn_w4_clock_khz = khz;
+            } else {
+                s_ffn_w4_clock_khz = 0;
+            }
+        }
+        debug_ffn_w4_clock_khz = s_ffn_w4_clock_khz;
     }
     int flash_parts = _split_flash_parts();
     if (flash_parts < 1) flash_parts = 1;
@@ -176,6 +193,7 @@ extern "C" void launch_split_decode_gemm(
     float* flash_part_s_dev = nullptr;
     float* flash_part_out_dev = nullptr;
     int flash_part_cap = 0;
+    SplitFfnW4FineDebugRec* ffn_w4_fine_dev = nullptr;
     if (debug_flash_decode) {
         static SplitFlashDecodeDebugRec* s_flash_debug_dev = nullptr;
         static int s_flash_debug_cap = 0;
@@ -230,6 +248,21 @@ extern "C" void launch_split_decode_gemm(
         flash_phase_debug_dev = s_flash_phase_debug_dev;
         flash_phase_debug_host = s_flash_phase_debug_host;
         flash_phase_debug_cap = s_flash_phase_debug_cap;
+    }
+    if (debug_ffn_w4_fine) {
+        static SplitFfnW4FineDebugRec* s_ffn_w4_fine_dev = nullptr;
+        if (s_ffn_w4_fine_dev == nullptr) {
+            if (cudaMalloc((void**)&s_ffn_w4_fine_dev, sizeof(SplitFfnW4FineDebugRec)) != cudaSuccess) {
+                s_ffn_w4_fine_dev = nullptr;
+            }
+        }
+        ffn_w4_fine_dev = s_ffn_w4_fine_dev;
+        if (ffn_w4_fine_dev == nullptr) {
+            std::printf("[MEGAQWEN_DEBUG] FFN_W4_FINE debug buffer alloc failed, disable fine output.\n");
+            debug_ffn_w4_fine = false;
+        } else {
+            cudaMemsetAsync(ffn_w4_fine_dev, 0, sizeof(SplitFfnW4FineDebugRec), stream);
+        }
     }
     if (flash_parts > 1) {
         static float* s_flash_part_m_dev = nullptr;
@@ -1542,14 +1575,15 @@ extern "C" void launch_split_decode_gemm(
         bool o_use_gemv = _split_o_use_gemv();
         bool o_try_lt = _split_o_try_cublaslt();
         if (o_w4) {
-            split_w4_matvec_bf16_out_kernel<<<HIDDEN_SIZE, 256, 0, stream>>>(
+            split_w4_matvec_bf16_out_kernel_t<256><<<HIDDEN_SIZE, 256, 0, stream>>>(
                 o_w4_packed,
                 o_w4_scales,
                 o_w4_codebook,
                 (const __nv_bfloat16*)attn_out_bf16,
                 (__nv_bfloat16*)o_proj_out_bf16,
                 HIDDEN_SIZE,
-                Q_SIZE
+                Q_SIZE,
+                nullptr
             );
             o_done = true;
             if (debug_stage_avg) {
@@ -1638,16 +1672,86 @@ extern "C" void launch_split_decode_gemm(
         bool gateup_gemv_done = false;
         bool gateup_use_gemv = _split_gateup_use_gemv();
         bool gateup_try_lt = _split_gateup_try_cublaslt();
+        int gateup_w4_block = _split_gateup_w4_block_threads();
+        bool gateup_w4_warp_row = _split_gateup_w4_warp_row_enabled();
         if (ffn_w4) {
-            split_w4_matvec_bf16_out_kernel<<<GATEUP_ROWS, 256, 0, stream>>>(
-                gateup_w4_packed,
-                gateup_w4_scales,
-                gateup_w4_codebook,
-                (const __nv_bfloat16*)mlp_norm_bf16,
-                (__nv_bfloat16*)gateup_out_bf16,
-                GATEUP_ROWS,
-                HIDDEN_SIZE
-            );
+            if (gateup_w4_warp_row) {
+                if (gateup_w4_block == 128) {
+                    constexpr int kWarps = 128 / WARP_SIZE;
+                    int grid = (GATEUP_ROWS + kWarps - 1) / kWarps;
+                    split_w4_matvec_warp_per_row_kernel_t<128><<<grid, 128, 0, stream>>>(
+                        gateup_w4_packed,
+                        gateup_w4_scales,
+                        gateup_w4_codebook,
+                        (const __nv_bfloat16*)mlp_norm_bf16,
+                        (__nv_bfloat16*)gateup_out_bf16,
+                        GATEUP_ROWS,
+                        HIDDEN_SIZE,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else if (gateup_w4_block == 192) {
+                    constexpr int kWarps = 192 / WARP_SIZE;
+                    int grid = (GATEUP_ROWS + kWarps - 1) / kWarps;
+                    split_w4_matvec_warp_per_row_kernel_t<192><<<grid, 192, 0, stream>>>(
+                        gateup_w4_packed,
+                        gateup_w4_scales,
+                        gateup_w4_codebook,
+                        (const __nv_bfloat16*)mlp_norm_bf16,
+                        (__nv_bfloat16*)gateup_out_bf16,
+                        GATEUP_ROWS,
+                        HIDDEN_SIZE,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else {
+                    constexpr int kWarps = 256 / WARP_SIZE;
+                    int grid = (GATEUP_ROWS + kWarps - 1) / kWarps;
+                    split_w4_matvec_warp_per_row_kernel_t<256><<<grid, 256, 0, stream>>>(
+                        gateup_w4_packed,
+                        gateup_w4_scales,
+                        gateup_w4_codebook,
+                        (const __nv_bfloat16*)mlp_norm_bf16,
+                        (__nv_bfloat16*)gateup_out_bf16,
+                        GATEUP_ROWS,
+                        HIDDEN_SIZE,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                }
+            } else {
+                if (gateup_w4_block == 128) {
+                    split_w4_matvec_bf16_out_kernel_t<128><<<GATEUP_ROWS, 128, 0, stream>>>(
+                        gateup_w4_packed,
+                        gateup_w4_scales,
+                        gateup_w4_codebook,
+                        (const __nv_bfloat16*)mlp_norm_bf16,
+                        (__nv_bfloat16*)gateup_out_bf16,
+                        GATEUP_ROWS,
+                        HIDDEN_SIZE,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else if (gateup_w4_block == 192) {
+                    split_w4_matvec_bf16_out_kernel_t<192><<<GATEUP_ROWS, 192, 0, stream>>>(
+                        gateup_w4_packed,
+                        gateup_w4_scales,
+                        gateup_w4_codebook,
+                        (const __nv_bfloat16*)mlp_norm_bf16,
+                        (__nv_bfloat16*)gateup_out_bf16,
+                        GATEUP_ROWS,
+                        HIDDEN_SIZE,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                } else {
+                    split_w4_matvec_bf16_out_kernel_t<256><<<GATEUP_ROWS, 256, 0, stream>>>(
+                        gateup_w4_packed,
+                        gateup_w4_scales,
+                        gateup_w4_codebook,
+                        (const __nv_bfloat16*)mlp_norm_bf16,
+                        (__nv_bfloat16*)gateup_out_bf16,
+                        GATEUP_ROWS,
+                        HIDDEN_SIZE,
+                        debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
+                    );
+                }
+            }
             gateup_done = true;
             if (debug_stage_avg) {
                 auto& agg = _split_debug_agg();
@@ -1742,7 +1846,8 @@ extern "C" void launch_split_decode_gemm(
                 down_w4_scales,
                 down_w4_codebook,
                 (const float*)residual_f32,
-                (float*)hidden_f32
+                (float*)hidden_f32,
+                debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
             );
             down_done = true;
             down_w4_done = true;
@@ -1783,7 +1888,8 @@ extern "C" void launch_split_decode_gemm(
                     down_w4_codebook,
                     (const __nv_bfloat16*)mlp_intermediate_bf16,
                     (const float*)residual_f32,
-                    (float*)hidden_f32
+                    (float*)hidden_f32,
+                    debug_ffn_w4_fine ? ffn_w4_fine_dev : nullptr
                 );
                 down_done = true;
                 down_w4_done = true;
@@ -1948,5 +2054,22 @@ extern "C" void launch_split_decode_gemm(
             }
             printf("  %-16s total=%8.3f ms\n", "decode_step_sum", total_ms);
         }
+    }
+
+    if (debug_ffn_w4_fine && ffn_w4_fine_dev != nullptr) {
+        SplitFfnW4FineDebugRec rec{};
+        cudaMemcpyAsync(&rec, ffn_w4_fine_dev, sizeof(rec), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        auto& agg = _split_debug_agg();
+        agg.ffn_w4_fine_samples += 1;
+        if (debug_ffn_w4_clock_khz > 0) {
+            agg.ffn_w4_clock_khz = static_cast<long long>(debug_ffn_w4_clock_khz);
+        }
+        agg.gateup_dequant_cycles += rec.gateup_dequant_cycles;
+        agg.gateup_fma_cycles += rec.gateup_fma_cycles;
+        agg.gateup_reduce_cycles += rec.gateup_reduce_cycles;
+        agg.down_dequant_cycles += rec.down_dequant_cycles;
+        agg.down_act_cycles += rec.down_act_cycles;
+        agg.down_fma_cycles += rec.down_fma_cycles;
     }
 }
